@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import multiprocessing as mp
 import os
 import time
 import uuid
@@ -26,17 +27,19 @@ async def recreate_database() -> None:
     bench_db = urlparse(os.environ["BENCHMARK_DATABASE_URL"]).path.lstrip("/")
     conn = await asyncpg.connect(admin_url)
     try:
-        await conn.execute(
-            f'DROP DATABASE IF EXISTS "{bench_db}" WITH (FORCE)'
-        )
+        await conn.execute(f'DROP DATABASE IF EXISTS "{bench_db}" WITH (FORCE)')
         await conn.execute(f'CREATE DATABASE "{bench_db}"')
     finally:
         await conn.close()
 
 
-async def setup(pool: asyncpg.Pool) -> None:
-    async with pool.acquire() as conn:
+async def create_table() -> None:
+    db_url = os.environ["BENCHMARK_DATABASE_URL"]
+    conn = await asyncpg.connect(db_url)
+    try:
         await conn.execute(TABLE_DDL)
+    finally:
+        await conn.close()
 
 
 async def insert_batch(
@@ -58,13 +61,15 @@ def percentile(values: list[float], pct: float) -> float:
     return s[k]
 
 
-async def run(target_rps: int, duration_s: float, batch_size: int, pool_size: int) -> None:
-    await recreate_database()
+async def worker_async(
+    target_rps: int,
+    duration_s: float,
+    batch_size: int,
+    pool_size: int,
+) -> dict:
     db_url = os.environ["BENCHMARK_DATABASE_URL"]
     pool = await asyncpg.create_pool(db_url, min_size=pool_size, max_size=pool_size)
     try:
-        await setup(pool)
-
         batches_per_second = target_rps / batch_size
         interval = 1.0 / batches_per_second
         total_batches = int(batches_per_second * duration_s)
@@ -93,45 +98,103 @@ async def run(target_rps: int, duration_s: float, batch_size: int, pool_size: in
             tasks.add(task)
         schedule_done = time.monotonic()
 
-        # Wait for in-flight batches to complete.
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.monotonic() - start
 
-        schedule_time = schedule_done - start
-        drain_time = elapsed - schedule_time
-        total_inserts = completed * batch_size
-        actual_rps = total_inserts / elapsed
-
-        print(f"Target RPS:      {target_rps}")
-        print(f"Batch size:      {batch_size}")
-        print(f"Pool size:       {pool_size}")
-        print(f"Schedule time:   {schedule_time:.2f}s")
-        print(f"Drain time:      {drain_time:.2f}s   (>0 means DB couldn't keep up)")
-        print(f"Total elapsed:   {elapsed:.2f}s")
-        print(f"Batches OK:      {completed}")
-        print(f"Batches FAIL:    {failed}")
-        print(f"Total inserts:   {total_inserts}")
-        print(f"Actual RPS:      {actual_rps:.0f}")
-        print(
-            "Batch latency:   "
-            f"p50={percentile(latencies, 50)*1000:.1f}ms "
-            f"p95={percentile(latencies, 95)*1000:.1f}ms "
-            f"p99={percentile(latencies, 99)*1000:.1f}ms "
-            f"max={max(latencies)*1000:.1f}ms"
-        )
+        return {
+            "completed": completed,
+            "failed": failed,
+            "schedule_time": schedule_done - start,
+            "elapsed": elapsed,
+            "latencies": latencies,
+        }
     finally:
         await pool.close()
 
 
+def worker_entry(
+    target_rps: int,
+    duration_s: float,
+    batch_size: int,
+    pool_size: int,
+    result_queue: mp.Queue,
+) -> None:
+    result = asyncio.run(worker_async(target_rps, duration_s, batch_size, pool_size))
+    result_queue.put(result)
+
+
+def run_multiprocess(
+    total_rps: int,
+    duration_s: float,
+    batch_size: int,
+    pool_size: int,
+    processes: int,
+) -> None:
+    asyncio.run(recreate_database())
+    asyncio.run(create_table())
+
+    per_proc_rps = total_rps // processes
+
+    ctx = mp.get_context("spawn")
+    result_queue: mp.Queue = ctx.Queue()
+    workers = []
+    for _ in range(processes):
+        p = ctx.Process(
+            target=worker_entry,
+            args=(per_proc_rps, duration_s, batch_size, pool_size, result_queue),
+        )
+        p.start()
+        workers.append(p)
+
+    results = [result_queue.get() for _ in workers]
+    for p in workers:
+        p.join()
+
+    completed = sum(r["completed"] for r in results)
+    failed = sum(r["failed"] for r in results)
+    schedule_time = max(r["schedule_time"] for r in results)
+    elapsed = max(r["elapsed"] for r in results)
+    drain_time = elapsed - schedule_time
+    total_inserts = completed * batch_size
+    actual_rps = total_inserts / elapsed
+
+    all_latencies: list[float] = []
+    for r in results:
+        all_latencies.extend(r["latencies"])
+
+    print(f"Processes:       {processes}")
+    print(f"Target RPS:      {total_rps}  ({per_proc_rps}/proc)")
+    print(f"Batch size:      {batch_size}")
+    print(f"Pool size/proc:  {pool_size}")
+    print(f"Schedule time:   {schedule_time:.2f}s")
+    print(f"Drain time:      {drain_time:.2f}s   (>0 means DB couldn't keep up)")
+    print(f"Total elapsed:   {elapsed:.2f}s")
+    print(f"Batches OK:      {completed}")
+    print(f"Batches FAIL:    {failed}")
+    print(f"Total inserts:   {total_inserts}")
+    print(f"Actual RPS:      {actual_rps:.0f}")
+    if all_latencies:
+        print(
+            "Batch latency:   "
+            f"p50={percentile(all_latencies, 50)*1000:.1f}ms "
+            f"p95={percentile(all_latencies, 95)*1000:.1f}ms "
+            f"p99={percentile(all_latencies, 99)*1000:.1f}ms "
+            f"max={max(all_latencies)*1000:.1f}ms"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rps", type=int, required=True, help="Target inserts per second")
+    parser.add_argument("--rps", type=int, required=True, help="Total target inserts per second")
     parser.add_argument("--duration", type=float, default=30.0, help="Run duration in seconds")
     parser.add_argument("--batch-size", type=int, default=10, help="Inserts per batch")
-    parser.add_argument("--pool-size", type=int, default=32, help="asyncpg pool size")
+    parser.add_argument("--pool-size", type=int, default=32, help="asyncpg pool size per process")
+    parser.add_argument("--processes", type=int, default=4, help="Number of worker processes")
     args = parser.parse_args()
-    asyncio.run(run(args.rps, args.duration, args.batch_size, args.pool_size))
+    run_multiprocess(
+        args.rps, args.duration, args.batch_size, args.pool_size, args.processes
+    )
 
 
 if __name__ == "__main__":

@@ -62,7 +62,7 @@ resource "aws_security_group" "rds" {
   tags = { Name = "dbos-bench-rds-sg" }
 }
 
-# --- RDS (db.m5d.24xlarge) ---
+# --- RDS (db.m7i.2xlarge) ---
 
 resource "aws_db_instance" "postgres" {
   identifier     = "dbos-bench-postgres"
@@ -77,20 +77,23 @@ resource "aws_db_instance" "postgres" {
   username               = local.db_username
   password               = local.db_password
   port                   = 5432
+  availability_zone      = "${var.aws_region}a"
   publicly_accessible    = false
   skip_final_snapshot    = true
+  backup_retention_period = 0
   vpc_security_group_ids = [aws_security_group.rds.id]
 
   tags = { Name = "dbos-bench-postgres" }
 }
 
-# --- EC2 (m5.24xlarge) ---
+# --- EC2 (m7i.2xlarge) ---
 
 resource "aws_instance" "bench" {
   ami                         = "ami-04eaa218f1349d88b" # Ubuntu 24.04 LTS amd64 us-east-1
   instance_type               = "m7i.2xlarge"
   vpc_security_group_ids      = [aws_security_group.ec2.id]
   key_name                    = var.key_name
+  availability_zone           = "${var.aws_region}a"
   associate_public_ip_address = true
 
   root_block_device {

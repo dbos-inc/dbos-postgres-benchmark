@@ -5,6 +5,7 @@
 *.tfvars
 *.tfvars.json
 .terraform.lock.hcl
+.terraform.tfstate.lock.info
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

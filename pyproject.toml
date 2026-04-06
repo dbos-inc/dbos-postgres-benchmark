@@ -2,7 +2,7 @@
 name = "dbos-postgres-benchmark"
 version = "0.1.0"
 description = "Postgres and DBOS benchmarks"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
     "asyncpg>=0.29",
 ]

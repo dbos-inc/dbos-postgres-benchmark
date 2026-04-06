@@ -45,7 +45,7 @@ async def create_table() -> None:
 async def insert_batch(
     pool: asyncpg.Pool, batch_size: int, latencies: list[float]
 ) -> None:
-    rows = [(uuid.uuid4(), f"payload-{i}") for i in range(batch_size)]
+    rows = [(uuid.uuid7(), f"payload-{i}") for i in range(batch_size)]
     t0 = time.monotonic()
     async with pool.acquire() as conn:
         for row_id, payload in rows:

@@ -39,10 +39,22 @@ async def setup(pool: asyncpg.Pool) -> None:
         await conn.execute(TABLE_DDL)
 
 
-async def insert_batch(pool: asyncpg.Pool, batch_size: int) -> None:
+async def insert_batch(
+    pool: asyncpg.Pool, batch_size: int, latencies: list[float]
+) -> None:
     rows = [(uuid.uuid4(), f"payload-{i}") for i in range(batch_size)]
+    t0 = time.monotonic()
     async with pool.acquire() as conn:
         await conn.executemany(INSERT_SQL, rows)
+    latencies.append(time.monotonic() - t0)
+
+
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round(pct / 100 * (len(s) - 1)))))
+    return s[k]
 
 
 async def run(target_rps: int, duration_s: float, batch_size: int, pool_size: int) -> None:
@@ -58,6 +70,7 @@ async def run(target_rps: int, duration_s: float, batch_size: int, pool_size: in
 
         completed = 0
         failed = 0
+        latencies: list[float] = []
         tasks: set[asyncio.Task] = set()
 
         def on_done(task: asyncio.Task) -> None:
@@ -74,24 +87,38 @@ async def run(target_rps: int, duration_s: float, batch_size: int, pool_size: in
             now = time.monotonic()
             if target_time > now:
                 await asyncio.sleep(target_time - now)
-            task = asyncio.create_task(insert_batch(pool, batch_size))
+            task = asyncio.create_task(insert_batch(pool, batch_size, latencies))
             task.add_done_callback(on_done)
             tasks.add(task)
+        schedule_done = time.monotonic()
 
         # Wait for in-flight batches to complete.
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         elapsed = time.monotonic() - start
 
+        schedule_time = schedule_done - start
+        drain_time = elapsed - schedule_time
         total_inserts = completed * batch_size
         actual_rps = total_inserts / elapsed
-        print(f"Target RPS:    {target_rps}")
-        print(f"Batch size:    {batch_size}")
-        print(f"Duration:      {elapsed:.2f}s")
-        print(f"Batches OK:    {completed}")
-        print(f"Batches FAIL:  {failed}")
-        print(f"Total inserts: {total_inserts}")
-        print(f"Actual RPS:    {actual_rps:.0f}")
+
+        print(f"Target RPS:      {target_rps}")
+        print(f"Batch size:      {batch_size}")
+        print(f"Pool size:       {pool_size}")
+        print(f"Schedule time:   {schedule_time:.2f}s")
+        print(f"Drain time:      {drain_time:.2f}s   (>0 means DB couldn't keep up)")
+        print(f"Total elapsed:   {elapsed:.2f}s")
+        print(f"Batches OK:      {completed}")
+        print(f"Batches FAIL:    {failed}")
+        print(f"Total inserts:   {total_inserts}")
+        print(f"Actual RPS:      {actual_rps:.0f}")
+        print(
+            "Batch latency:   "
+            f"p50={percentile(latencies, 50)*1000:.1f}ms "
+            f"p95={percentile(latencies, 95)*1000:.1f}ms "
+            f"p99={percentile(latencies, 99)*1000:.1f}ms "
+            f"max={max(latencies)*1000:.1f}ms"
+        )
     finally:
         await pool.close()
 

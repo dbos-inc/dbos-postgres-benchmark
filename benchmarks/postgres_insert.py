@@ -4,33 +4,49 @@ import argparse
 import asyncio
 import os
 import time
+import uuid
+from urllib.parse import urlparse
 
 import asyncpg
 
 TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS bench_inserts (
-    id BIGSERIAL PRIMARY KEY,
+    id UUID PRIMARY KEY,
     payload TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 )
 """
 
-INSERT_SQL = "INSERT INTO bench_inserts (payload) VALUES ($1)"
+INSERT_SQL = "INSERT INTO bench_inserts (id, payload) VALUES ($1, $2)"
+
+
+async def recreate_database() -> None:
+    """Drop and recreate the benchmark database via POSTGRES_DATABASE_URL."""
+    admin_url = os.environ["POSTGRES_DATABASE_URL"]
+    bench_db = urlparse(os.environ["BENCHMARK_DATABASE_URL"]).path.lstrip("/")
+    conn = await asyncpg.connect(admin_url)
+    try:
+        await conn.execute(
+            f'DROP DATABASE IF EXISTS "{bench_db}" WITH (FORCE)'
+        )
+        await conn.execute(f'CREATE DATABASE "{bench_db}"')
+    finally:
+        await conn.close()
 
 
 async def setup(pool: asyncpg.Pool) -> None:
     async with pool.acquire() as conn:
         await conn.execute(TABLE_DDL)
-        await conn.execute("TRUNCATE bench_inserts")
 
 
 async def insert_batch(pool: asyncpg.Pool, batch_size: int) -> None:
-    rows = [(f"payload-{i}",) for i in range(batch_size)]
+    rows = [(uuid.uuid4(), f"payload-{i}") for i in range(batch_size)]
     async with pool.acquire() as conn:
         await conn.executemany(INSERT_SQL, rows)
 
 
 async def run(target_rps: int, duration_s: float, batch_size: int, pool_size: int) -> None:
+    await recreate_database()
     db_url = os.environ["BENCHMARK_DATABASE_URL"]
     pool = await asyncpg.create_pool(db_url, min_size=pool_size, max_size=pool_size)
     try:

@@ -69,19 +69,19 @@ resource "aws_db_instance" "postgres" {
   engine         = "postgres"
   engine_version = "16"
 
-  instance_class         = "db.m7i.2xlarge"
-  allocated_storage      = 100
-  storage_type           = "io2"
-  iops                   = 40000
-  db_name                = "postgres"
-  username               = local.db_username
-  password               = local.db_password
-  port                   = 5432
-  availability_zone      = "${var.aws_region}a"
-  publicly_accessible    = false
-  skip_final_snapshot    = true
+  instance_class          = "db.m7i.2xlarge"
+  allocated_storage       = 100
+  storage_type            = "io2"
+  iops                    = 40000
+  db_name                 = "postgres"
+  username                = local.db_username
+  password                = local.db_password
+  port                    = 5432
+  availability_zone       = "${var.aws_region}a"
+  publicly_accessible     = false
+  skip_final_snapshot     = true
   backup_retention_period = 0
-  vpc_security_group_ids = [aws_security_group.rds.id]
+  vpc_security_group_ids  = [aws_security_group.rds.id]
 
   tags = { Name = "dbos-bench-postgres" }
 }

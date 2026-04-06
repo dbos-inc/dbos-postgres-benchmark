@@ -45,7 +45,8 @@ async def insert_batch(
     rows = [(uuid.uuid4(), f"payload-{i}") for i in range(batch_size)]
     t0 = time.monotonic()
     async with pool.acquire() as conn:
-        await conn.executemany(INSERT_SQL, rows)
+        for row_id, payload in rows:
+            await conn.execute(INSERT_SQL, row_id, payload)
     latencies.append(time.monotonic() - t0)
 
 

@@ -5,6 +5,7 @@ import asyncio
 import multiprocessing as mp
 import os
 import time
+import uuid
 from urllib.parse import urlparse
 
 import asyncpg
@@ -49,6 +50,7 @@ def worker_entry(
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": pool_size,
+        "executor_id": str(uuid.uuid7()),
     }
     DBOS(config=config)
     DBOS.launch()

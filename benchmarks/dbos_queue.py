@@ -58,6 +58,7 @@ def worker_entry(
     pool_size: int,
     executor_threads: int,
     num_queues: int,
+    startup_barrier,
     enqueue_done_barrier,
     done_barrier,
     result_queue: mp.Queue,
@@ -94,6 +95,9 @@ def worker_entry(
     DBOS(config=config)
     DBOS.listen_queues(listen)
     DBOS.launch()
+
+    # Wait until every worker is fully launched before any starts enqueueing.
+    startup_barrier.wait()
 
     async def enqueue_batch() -> int:
         # Fire all enqueues in this batch concurrently. Each workflow goes to a
@@ -192,6 +196,7 @@ def run_multiprocess(
     bootstrap.join()
 
     result_queue: mp.Queue = ctx.Queue()
+    startup_barrier = ctx.Barrier(processes)
     enqueue_done_barrier = ctx.Barrier(processes)
     done_barrier = ctx.Barrier(processes)
     workers = []
@@ -207,6 +212,7 @@ def run_multiprocess(
                 pool_size,
                 executor_threads,
                 num_queues,
+                startup_barrier,
                 enqueue_done_barrier,
                 done_barrier,
                 result_queue,

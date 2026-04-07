@@ -57,9 +57,11 @@ def worker_entry(
 
     async def start_batch(latencies: list[float]) -> None:
         t0 = time.monotonic()
-        for _ in range(batch_size):
-            handle = await DBOS.start_workflow_async(noop_workflow)
-            await handle.get_result()
+        handles = [
+            await DBOS.start_workflow_async(noop_workflow)
+            for _ in range(batch_size)
+        ]
+        await asyncio.gather(*(h.get_result() for h in handles))
         latencies.append(time.monotonic() - t0)
 
     async def run() -> dict:
@@ -181,7 +183,7 @@ def main() -> None:
         "--batch-size", type=int, default=10, help="Workflow starts per batch"
     )
     parser.add_argument(
-        "--pool-size", type=int, default=32, help="DBOS system DB pool size per process"
+        "--pool-size", type=int, default=64, help="DBOS system DB pool size per process"
     )
     parser.add_argument(
         "--processes", type=int, default=4, help="Number of worker processes"

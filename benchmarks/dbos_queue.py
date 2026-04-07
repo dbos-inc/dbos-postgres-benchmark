@@ -64,7 +64,7 @@ def worker_entry(
     async def noop_workflow() -> int:
         return 1
 
-    queue = Queue("bench-queue", worker_concurrency=500)
+    queue = Queue("bench-queue", polling_interval_sec=0.1)
 
     config: DBOSConfig = {
         "name": "dbos-queue-bench",

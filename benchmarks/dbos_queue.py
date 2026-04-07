@@ -49,7 +49,8 @@ def bootstrap_schema_entry() -> None:
 def worker_entry(
     target_rps: int,
     duration_s: float,
-    batch_size: int,
+    enqueue_batch_size: int,
+    drain_batch_size: int,
     pool_size: int,
     executor_threads: int,
     done_barrier,
@@ -77,11 +78,11 @@ def worker_entry(
     async def enqueue_batch() -> list:
         # Fire all enqueues in this batch concurrently.
         return await asyncio.gather(
-            *(queue.enqueue_async(noop_workflow) for _ in range(batch_size))
+            *(queue.enqueue_async(noop_workflow) for _ in range(enqueue_batch_size))
         )
 
     async def run() -> dict:
-        batches_per_second = target_rps / batch_size
+        batches_per_second = target_rps / enqueue_batch_size
         interval = 1.0 / batches_per_second
         total_batches = int(batches_per_second * duration_s)
 
@@ -116,7 +117,8 @@ def worker_entry(
             return ok
 
         drain_batches = [
-            handles[i : i + batch_size] for i in range(0, len(handles), batch_size)
+            handles[i : i + drain_batch_size]
+            for i in range(0, len(handles), drain_batch_size)
         ]
         batch_results = await asyncio.gather(
             *(drain_batch(b) for b in drain_batches)
@@ -148,7 +150,8 @@ def worker_entry(
 def run_multiprocess(
     total_rps: int,
     duration_s: float,
-    batch_size: int,
+    enqueue_batch_size: int,
+    drain_batch_size: int,
     pool_size: int,
     executor_threads: int,
     processes: int,
@@ -174,7 +177,8 @@ def run_multiprocess(
             args=(
                 per_proc_rps,
                 duration_s,
-                batch_size,
+                enqueue_batch_size,
+                drain_batch_size,
                 pool_size,
                 executor_threads,
                 done_barrier,
@@ -199,7 +203,8 @@ def run_multiprocess(
 
     print(f"Processes:        {processes}")
     print(f"Target RPS:       {total_rps}  ({per_proc_rps}/proc)")
-    print(f"Batch size:       {batch_size}")
+    print(f"Enqueue batch:    {enqueue_batch_size}")
+    print(f"Drain batch:      {drain_batch_size}")
     print(f"Pool size/proc:   {pool_size}")
     print(f"Exec threads/proc:{executor_threads}")
     print(f"Enqueue time:     {enqueue_time:.2f}s")
@@ -221,7 +226,16 @@ def main() -> None:
         "--duration", type=float, default=30.0, help="Enqueue phase duration in seconds"
     )
     parser.add_argument(
-        "--batch-size", type=int, default=100, help="Concurrent enqueues per batch"
+        "--enqueue-batch",
+        type=int,
+        default=100,
+        help="Concurrent enqueues per batch (Phase 1)",
+    )
+    parser.add_argument(
+        "--drain-batch",
+        type=int,
+        default=1000,
+        help="Handles per drain batch, awaited sequentially (Phase 2)",
     )
     parser.add_argument(
         "--pool-size", type=int, default=16, help="DBOS system DB pool size per process"
@@ -239,7 +253,8 @@ def main() -> None:
     run_multiprocess(
         args.rps,
         args.duration,
-        args.batch_size,
+        args.enqueue_batch,
+        args.drain_batch,
         args.pool_size,
         args.executor_threads,
         args.processes,

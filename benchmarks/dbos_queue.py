@@ -103,6 +103,11 @@ def worker_entry(
             except Exception:
                 enqueue_failures += 1
         enqueue_end = time.monotonic()
+        print(
+            f"[pid {os.getpid()}] enqueue done: "
+            f"{len(handles)} handles in {enqueue_end - enqueue_start:.2f}s",
+            flush=True,
+        )
 
         # --- Phase 2: drain all completions ---
         # Process chunks sequentially, fully concurrent within a chunk.
@@ -225,7 +230,7 @@ def main() -> None:
     parser.add_argument(
         "--drain-batch",
         type=int,
-        default=100,
+        default=1,
         help="Handles per drain batch, awaited sequentially (Phase 2)",
     )
     parser.add_argument(

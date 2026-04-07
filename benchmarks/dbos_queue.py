@@ -26,14 +26,6 @@ async def recreate_database() -> None:
         await conn.close()
 
 
-def percentile(values: list[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    s = sorted(values)
-    k = max(0, min(len(s) - 1, int(round(pct / 100 * (len(s) - 1)))))
-    return s[k]
-
-
 def bootstrap_schema_entry() -> None:
     """Pre-create the DBOS system schema in a one-shot subprocess.
 
@@ -93,14 +85,10 @@ def worker_entry(
         interval = 1.0 / batches_per_second
         total_batches = int(batches_per_second * duration_s)
 
-        wait_tasks: list[asyncio.Task] = []
+        handles: list = []
         enqueue_failures = 0
 
-        async def wait_one(h, enqueue_t: float) -> float:
-            await h.get_result()
-            return time.monotonic() - enqueue_t
-
-        # --- Phase 1: enqueue at target rate, fire a wait task per handle ---
+        # --- Phase 1: enqueue at target rate ---
         enqueue_start = time.monotonic()
         for i in range(total_batches):
             target_time = enqueue_start + i * interval
@@ -108,29 +96,42 @@ def worker_entry(
             if target_time > now:
                 await asyncio.sleep(target_time - now)
             try:
-                batch_handles = await enqueue_batch()
-                t = time.monotonic()
-                for h in batch_handles:
-                    wait_tasks.append(asyncio.create_task(wait_one(h, t)))
+                handles.extend(await enqueue_batch())
             except Exception:
                 enqueue_failures += 1
         enqueue_end = time.monotonic()
 
         # --- Phase 2: drain all completions ---
-        results = await asyncio.gather(*wait_tasks, return_exceptions=True)
+        # Split handles into batches; each batch waits for its handles
+        # sequentially, batches run concurrently. This caps the number of
+        # simultaneously-polling get_result calls.
+        async def drain_batch(batch_handles: list) -> int:
+            ok = 0
+            for h in batch_handles:
+                try:
+                    await h.get_result()
+                    ok += 1
+                except Exception:
+                    pass
+            return ok
+
+        drain_batches = [
+            handles[i : i + batch_size] for i in range(0, len(handles), batch_size)
+        ]
+        batch_results = await asyncio.gather(
+            *(drain_batch(b) for b in drain_batches)
+        )
         drain_end = time.monotonic()
 
-        latencies = [r for r in results if isinstance(r, float)]
-        completed = len(latencies)
+        completed = sum(batch_results)
 
         return {
-            "enqueued": len(wait_tasks),
+            "enqueued": len(handles),
             "enqueue_failures": enqueue_failures,
             "completed": completed,
             "enqueue_time": enqueue_end - enqueue_start,
             "drain_time": drain_end - enqueue_end,
             "total_time": drain_end - enqueue_start,
-            "latencies": latencies,
         }
 
     try:
@@ -196,10 +197,6 @@ def run_multiprocess(
     enqueue_rps = enqueued / enqueue_time if enqueue_time > 0 else 0
     completion_rps = completed / total_time if total_time > 0 else 0
 
-    all_latencies: list[float] = []
-    for r in results:
-        all_latencies.extend(r["latencies"])
-
     print(f"Processes:        {processes}")
     print(f"Target RPS:       {total_rps}  ({per_proc_rps}/proc)")
     print(f"Batch size:       {batch_size}")
@@ -213,14 +210,6 @@ def run_multiprocess(
     print(f"Enqueue failures: {enqueue_failures}")
     print(f"Enqueue RPS:      {enqueue_rps:.0f}")
     print(f"Completion RPS:   {completion_rps:.0f}   (end-to-end)")
-    if all_latencies:
-        print(
-            "Workflow latency: "
-            f"p50={percentile(all_latencies, 50)*1000:.1f}ms "
-            f"p95={percentile(all_latencies, 95)*1000:.1f}ms "
-            f"p99={percentile(all_latencies, 99)*1000:.1f}ms "
-            f"max={max(all_latencies)*1000:.1f}ms"
-        )
 
 
 def main() -> None:

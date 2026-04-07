@@ -59,6 +59,7 @@ def worker_entry(
     executor_threads: int,
     num_queues: int,
     startup_barrier,
+    warmup_done_barrier,
     enqueue_done_barrier,
     done_barrier,
     result_queue: mp.Queue,
@@ -110,10 +111,33 @@ def worker_entry(
         )
         return enqueue_batch_size
 
+    WARMUP_S = 5.0
+    WARMUP_RATE_DIVISOR = 10
+
     async def run() -> dict:
         batches_per_second = target_rps / enqueue_batch_size
         interval = 1.0 / batches_per_second
         total_batches = int(batches_per_second * duration_s)
+
+        # --- Warmup: enqueue at target_rps/10 for WARMUP_S seconds ---
+        # Lets DBOS executors warm caches, prepare statements, and stabilize
+        # before the measured phase begins. Warmup workflows are not counted.
+        warmup_batches_per_second = batches_per_second / WARMUP_RATE_DIVISOR
+        warmup_interval = 1.0 / warmup_batches_per_second if warmup_batches_per_second > 0 else 0
+        warmup_total_batches = int(warmup_batches_per_second * WARMUP_S)
+        warmup_start = time.monotonic()
+        for i in range(warmup_total_batches):
+            target_time = warmup_start + i * warmup_interval
+            now = time.monotonic()
+            if target_time > now:
+                await asyncio.sleep(target_time - now)
+            try:
+                await enqueue_batch()
+            except Exception:
+                pass
+
+        # Sync all workers before the measured phase starts.
+        warmup_done_barrier.wait()
 
         enqueued = 0
         enqueue_failures = 0
@@ -197,6 +221,7 @@ def run_multiprocess(
 
     result_queue: mp.Queue = ctx.Queue()
     startup_barrier = ctx.Barrier(processes)
+    warmup_done_barrier = ctx.Barrier(processes)
     enqueue_done_barrier = ctx.Barrier(processes)
     done_barrier = ctx.Barrier(processes)
     workers = []
@@ -213,6 +238,7 @@ def run_multiprocess(
                 executor_threads,
                 num_queues,
                 startup_barrier,
+                warmup_done_barrier,
                 enqueue_done_barrier,
                 done_barrier,
                 result_queue,

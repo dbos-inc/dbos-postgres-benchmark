@@ -34,6 +34,7 @@ def worker_entry(
     target_rps: int,
     duration_s: float,
     batch_size: int,
+    pool_size: int,
     result_queue: mp.Queue,
 ) -> None:
     # All DBOS code lives inside the worker process.
@@ -47,6 +48,7 @@ def worker_entry(
         "name": "dbos-bench",
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
+        "sys_db_pool_size": pool_size,
     }
     DBOS(config=config)
     DBOS.launch()
@@ -109,6 +111,7 @@ def run_multiprocess(
     total_rps: int,
     duration_s: float,
     batch_size: int,
+    pool_size: int,
     processes: int,
 ) -> None:
     asyncio.run(recreate_database())
@@ -121,7 +124,7 @@ def run_multiprocess(
     for _ in range(processes):
         p = ctx.Process(
             target=worker_entry,
-            args=(per_proc_rps, duration_s, batch_size, result_queue),
+            args=(per_proc_rps, duration_s, batch_size, pool_size, result_queue),
         )
         p.start()
         workers.append(p)
@@ -145,6 +148,7 @@ def run_multiprocess(
     print(f"Processes:       {processes}")
     print(f"Target RPS:      {total_rps}  ({per_proc_rps}/proc)")
     print(f"Batch size:      {batch_size}")
+    print(f"Pool size/proc:  {pool_size}")
     print(f"Schedule time:   {schedule_time:.2f}s")
     print(f"Drain time:      {drain_time:.2f}s   (>0 means DBOS couldn't keep up)")
     print(f"Total elapsed:   {elapsed:.2f}s")
@@ -167,9 +171,12 @@ def main() -> None:
     parser.add_argument("--rps", type=int, required=True, help="Total target workflow starts per second")
     parser.add_argument("--duration", type=float, default=30.0, help="Run duration in seconds")
     parser.add_argument("--batch-size", type=int, default=10, help="Workflow starts per batch")
+    parser.add_argument("--pool-size", type=int, default=32, help="DBOS system DB pool size per process")
     parser.add_argument("--processes", type=int, default=4, help="Number of worker processes")
     args = parser.parse_args()
-    run_multiprocess(args.rps, args.duration, args.batch_size, args.processes)
+    run_multiprocess(
+        args.rps, args.duration, args.batch_size, args.pool_size, args.processes
+    )
 
 
 if __name__ == "__main__":

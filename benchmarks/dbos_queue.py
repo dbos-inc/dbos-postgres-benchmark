@@ -128,9 +128,12 @@ def worker_entry(
         enqueue_failures = 0
 
         # --- Phase 1: enqueue at target rate ---
-        enqueue_start = time.monotonic()
+        # Record wall-clock start/end so the parent can compute elapsed across
+        # all workers as (last end - first start).
+        enqueue_start_wall = time.time()
+        loop_start = time.monotonic()
         for i in range(total_batches):
-            target_time = enqueue_start + i * interval
+            target_time = loop_start + i * interval
             now = time.monotonic()
             if target_time > now:
                 await asyncio.sleep(target_time - now)
@@ -138,10 +141,10 @@ def worker_entry(
                 enqueued += await enqueue_batch()
             except Exception:
                 enqueue_failures += 1
-        enqueue_end = time.monotonic()
+        enqueue_end_wall = time.time()
         print(
             f"[pid {os.getpid()}] enqueue done: "
-            f"{enqueued} workflows in {enqueue_end - enqueue_start:.2f}s",
+            f"{enqueued} workflows in {enqueue_end_wall - enqueue_start_wall:.2f}s",
             flush=True,
         )
 
@@ -152,17 +155,17 @@ def worker_entry(
         # Worker 0 polls until no ENQUEUED or PENDING workflows remain. Other
         # workers just wait. This avoids per-handle get_result polling pressure
         # on the system DB.
-        drain_time = 0.0
+        drain_start_wall = time.time()
+        drain_end_wall = drain_start_wall
         if worker_id == 0:
-            drain_start = time.monotonic()
             while True:
                 unfinished = await DBOS.list_workflows_async(status=["PENDING", "ENQUEUED"], limit=1)
                 if not unfinished:
                     break
                 await asyncio.sleep(0.1)
-            drain_time = time.monotonic() - drain_start
+            drain_end_wall = time.time()
             print(
-                f"[pid {os.getpid()}] drain done in {drain_time:.2f}s",
+                f"[pid {os.getpid()}] drain done in {drain_end_wall - drain_start_wall:.2f}s",
                 flush=True,
             )
 
@@ -194,8 +197,10 @@ def worker_entry(
         return {
             "enqueued": enqueued,
             "enqueue_failures": enqueue_failures,
-            "enqueue_time": enqueue_end - enqueue_start,
-            "drain_time": drain_time,
+            "enqueue_start_wall": enqueue_start_wall,
+            "enqueue_end_wall": enqueue_end_wall,
+            "drain_start_wall": drain_start_wall,
+            "drain_end_wall": drain_end_wall,
             "latencies": latencies,
         }
 
@@ -259,9 +264,12 @@ def run_multiprocess(
 
     enqueued = sum(r["enqueued"] for r in results)
     enqueue_failures = sum(r["enqueue_failures"] for r in results)
-    enqueue_time = max(r["enqueue_time"] for r in results)
-    drain_time = max(r["drain_time"] for r in results)
-    total_time = enqueue_time + drain_time
+    first_start = min(r["enqueue_start_wall"] for r in results)
+    last_enqueue_end = max(r["enqueue_end_wall"] for r in results)
+    last_drain_end = max(r["drain_end_wall"] for r in results)
+    enqueue_time = last_enqueue_end - first_start
+    drain_time = last_drain_end - last_enqueue_end
+    total_time = last_drain_end - first_start
     enqueue_rps = enqueued / enqueue_time if enqueue_time > 0 else 0
     completion_rps = enqueued / total_time if total_time > 0 else 0
     all_latencies: list[float] = []

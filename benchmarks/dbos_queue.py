@@ -76,14 +76,12 @@ def worker_entry(
         for i in range(num_queues)
     ]
 
-    # Partition listening across workers: each queue is listened to by exactly
-    # one worker (when num_queues >= num_workers, some workers listen to multiple;
-    # when num_queues < num_workers, surplus workers fall back to a round-robin
-    # assignment so every queue still has a listener and no worker is idle).
-    listen_queue_ids = [i for i in range(num_queues) if i % num_workers == worker_id]
-    if not listen_queue_ids:
-        listen_queue_ids = [worker_id % num_queues]
-    listen = [queues[i] for i in listen_queue_ids]
+    # Partition listening across workers. num_queues must divide num_workers,
+    # so each queue is listened to by exactly num_workers // num_queues workers.
+    assert num_workers % num_queues == 0, (
+        f"num_queues ({num_queues}) must divide num_workers ({num_workers})"
+    )
+    listen = [queues[worker_id % num_queues]]
 
     config: DBOSConfig = {
         "name": "dbos-queue-bench",

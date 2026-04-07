@@ -1,7 +1,8 @@
 """Benchmark DBOS queue.enqueue_async + completion throughput at a target rate.
 
-Two-phase: enqueue all workflows at the target rate, then drain all completions.
-Reports both enqueue and end-to-end completion throughput.
+Runs a fixed-duration window during which workers enqueue at the target rate.
+At the end of the window, counts workflows that have completed (status=SUCCESS).
+Throughput = completed / duration.
 """
 
 import argparse
@@ -59,7 +60,6 @@ def worker_entry(
     executor_threads: int,
     num_queues: int,
     startup_barrier,
-    enqueue_done_barrier,
     done_barrier,
     result_queue: mp.Queue,
 ) -> None:
@@ -113,55 +113,55 @@ def worker_entry(
     async def run() -> dict:
         batches_per_second = target_rps / enqueue_batch_size
         interval = 1.0 / batches_per_second
-        total_batches = int(batches_per_second * duration_s)
 
         enqueued = 0
         enqueue_failures = 0
 
-        # --- Phase 1: enqueue at target rate ---
-        enqueue_start = time.monotonic()
-        for i in range(total_batches):
-            target_time = enqueue_start + i * interval
+        # Enqueue at target rate until the fixed window ends.
+        window_start = time.monotonic()
+        window_end = window_start + duration_s
+        i = 0
+        while True:
+            target_time = window_start + i * interval
             now = time.monotonic()
+            if now >= window_end:
+                break
             if target_time > now:
-                await asyncio.sleep(target_time - now)
+                sleep_for = min(target_time - now, window_end - now)
+                await asyncio.sleep(sleep_for)
+                if time.monotonic() >= window_end:
+                    break
             try:
                 enqueued += await enqueue_batch()
             except Exception:
                 enqueue_failures += 1
+            i += 1
         enqueue_end = time.monotonic()
         print(
             f"[pid {os.getpid()}] enqueue done: "
-            f"{enqueued} workflows in {enqueue_end - enqueue_start:.2f}s",
+            f"{enqueued} workflows in {enqueue_end - window_start:.2f}s",
             flush=True,
         )
 
-        # Wait for every worker to finish enqueueing before measuring drain.
-        enqueue_done_barrier.wait()
-
-        # --- Phase 2: drain (worker 0 polls list_workflows) ---
-        # Worker 0 polls until no ENQUEUED or PENDING workflows remain. Other
-        # workers just wait. This avoids per-handle get_result polling pressure
-        # on the system DB.
-        drain_time = 0.0
+        # Worker 0 immediately counts SUCCESS workflows at the window end.
+        completed = 0
         if worker_id == 0:
-            drain_start = time.monotonic()
-            while True:
-                unfinished = await DBOS.list_workflows_async(status=["PENDING", "ENQUEUED"], limit=1)
-                if not unfinished:
-                    break
-                await asyncio.sleep(0.1)
-            drain_time = time.monotonic() - drain_start
+            conn = await asyncpg.connect(os.environ["BENCHMARK_DATABASE_URL"])
+            try:
+                completed = await conn.fetchval(
+                    "SELECT count(*) FROM dbos.workflow_status WHERE status = 'SUCCESS'"
+                )
+            finally:
+                await conn.close()
             print(
-                f"[pid {os.getpid()}] drain done in {drain_time:.2f}s",
+                f"[pid {os.getpid()}] completed at window end: {completed}",
                 flush=True,
             )
 
         return {
             "enqueued": enqueued,
             "enqueue_failures": enqueue_failures,
-            "enqueue_time": enqueue_end - enqueue_start,
-            "drain_time": drain_time,
+            "completed": completed,
         }
 
     try:
@@ -197,7 +197,6 @@ def run_multiprocess(
 
     result_queue: mp.Queue = ctx.Queue()
     startup_barrier = ctx.Barrier(processes)
-    enqueue_done_barrier = ctx.Barrier(processes)
     done_barrier = ctx.Barrier(processes)
     workers = []
     for worker_id in range(processes):
@@ -213,7 +212,6 @@ def run_multiprocess(
                 executor_threads,
                 num_queues,
                 startup_barrier,
-                enqueue_done_barrier,
                 done_barrier,
                 result_queue,
             ),
@@ -226,12 +224,10 @@ def run_multiprocess(
         p.join()
 
     enqueued = sum(r["enqueued"] for r in results)
+    completed = sum(r["completed"] for r in results)
     enqueue_failures = sum(r["enqueue_failures"] for r in results)
-    enqueue_time = max(r["enqueue_time"] for r in results)
-    drain_time = max(r["drain_time"] for r in results)
-    total_time = enqueue_time + drain_time
-    enqueue_rps = enqueued / enqueue_time if enqueue_time > 0 else 0
-    completion_rps = enqueued / total_time if total_time > 0 else 0
+    enqueue_rps = enqueued / duration_s
+    completion_rps = completed / duration_s
 
     print(f"Processes:        {processes}")
     print(f"Queues:           {num_queues}")
@@ -239,13 +235,12 @@ def run_multiprocess(
     print(f"Enqueue batch:    {enqueue_batch_size}")
     print(f"Pool size/proc:   {pool_size}")
     print(f"Exec threads/proc:{executor_threads}")
-    print(f"Enqueue time:     {enqueue_time:.2f}s")
-    print(f"Drain time:       {drain_time:.2f}s")
-    print(f"Total time:       {total_time:.2f}s")
+    print(f"Window:           {duration_s:.2f}s")
     print(f"Enqueued:         {enqueued}")
+    print(f"Completed:        {completed}   (status=SUCCESS at window end)")
     print(f"Enqueue failures: {enqueue_failures}")
     print(f"Enqueue RPS:      {enqueue_rps:.0f}")
-    print(f"Completion RPS:   {completion_rps:.0f}   (end-to-end)")
+    print(f"Completion RPS:   {completion_rps:.0f}   (completed / window)")
 
 
 def main() -> None:

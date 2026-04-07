@@ -103,29 +103,18 @@ def worker_entry(
         enqueue_end = time.monotonic()
 
         # --- Phase 2: drain all completions ---
-        # Split handles into batches; each batch waits for its handles
-        # sequentially, batches run concurrently. This caps the number of
-        # simultaneously-polling get_result calls.
-        async def drain_batch(batch_handles: list) -> int:
-            ok = 0
-            for h in batch_handles:
-                try:
-                    await h.get_result()
-                    ok += 1
-                except Exception:
-                    pass
-            return ok
-
-        drain_batches = [
-            handles[i : i + drain_batch_size]
-            for i in range(0, len(handles), drain_batch_size)
-        ]
-        batch_results = await asyncio.gather(
-            *(drain_batch(b) for b in drain_batches)
-        )
+        # Process chunks sequentially, fully concurrent within a chunk.
+        # At any moment, at most `drain_batch_size` get_result polls are active,
+        # regardless of total handle count. This bounds the polling pressure on
+        # the system DB so it can't starve workflow completion writes.
+        completed = 0
+        for i in range(0, len(handles), drain_batch_size):
+            chunk = handles[i : i + drain_batch_size]
+            results = await asyncio.gather(
+                *(h.get_result() for h in chunk), return_exceptions=True
+            )
+            completed += sum(1 for r in results if not isinstance(r, BaseException))
         drain_end = time.monotonic()
-
-        completed = sum(batch_results)
 
         return {
             "enqueued": len(handles),
@@ -234,7 +223,7 @@ def main() -> None:
     parser.add_argument(
         "--drain-batch",
         type=int,
-        default=1000,
+        default=100,
         help="Handles per drain batch, awaited sequentially (Phase 2)",
     )
     parser.add_argument(

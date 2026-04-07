@@ -51,6 +51,7 @@ def bootstrap_schema_entry() -> None:
 
 def worker_entry(
     worker_id: int,
+    num_workers: int,
     target_rps: int,
     duration_s: float,
     enqueue_batch_size: int,
@@ -68,12 +69,21 @@ def worker_entry(
     async def noop_workflow() -> int:
         return 1
 
-    # Create all queues in every worker so every executor polls every queue.
+    # Create all queues in every worker so any worker can enqueue to any queue.
     # Workflows are enqueued to a random queue per call.
     queues = [
         Queue(f"bench-queue-{i}", polling_interval_sec=sys.float_info.min)
         for i in range(num_queues)
     ]
+
+    # Partition listening across workers: each queue is listened to by exactly
+    # one worker (when num_queues >= num_workers, some workers listen to multiple;
+    # when num_queues < num_workers, surplus workers fall back to a round-robin
+    # assignment so every queue still has a listener and no worker is idle).
+    listen_queue_ids = [i for i in range(num_queues) if i % num_workers == worker_id]
+    if not listen_queue_ids:
+        listen_queue_ids = [worker_id % num_queues]
+    listen = [queues[i] for i in listen_queue_ids]
 
     config: DBOSConfig = {
         "name": "dbos-queue-bench",
@@ -84,6 +94,7 @@ def worker_entry(
         "executor_id": str(uuid.uuid7()),
     }
     DBOS(config=config)
+    DBOS.listen_queues(listen)
     DBOS.launch()
 
     async def enqueue_batch() -> int:
@@ -191,6 +202,7 @@ def run_multiprocess(
             target=worker_entry,
             args=(
                 worker_id,
+                processes,
                 per_proc_rps,
                 duration_s,
                 enqueue_batch_size,

@@ -31,3 +31,9 @@ uv run python benchmarks/postgres_insert.py --rps 5000 --duration 30
 ```bash
 uv run python benchmarks/dbos_start_workflow.py --rps 5000 --duration 30
 ```
+
+### DBOS queue throughput
+
+```bash
+uv run python benchmarks/dbos_queue.py --rps 5000 --duration 30
+```

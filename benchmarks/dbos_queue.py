@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import multiprocessing as mp
 import os
+import random
 import sys
 import time
 from urllib.parse import urlparse
@@ -55,6 +56,7 @@ def worker_entry(
     enqueue_batch_size: int,
     pool_size: int,
     executor_threads: int,
+    num_queues: int,
     enqueue_done_barrier,
     done_barrier,
     result_queue: mp.Queue,
@@ -66,7 +68,12 @@ def worker_entry(
     async def noop_workflow() -> int:
         return 1
 
-    queue = Queue("bench-queue", polling_interval_sec=sys.float_info.min)
+    # Create all queues in every worker so every executor polls every queue.
+    # Workflows are enqueued to a random queue per call.
+    queues = [
+        Queue(f"bench-queue-{i}", polling_interval_sec=sys.float_info.min)
+        for i in range(num_queues)
+    ]
 
     config: DBOSConfig = {
         "name": "dbos-queue-bench",
@@ -80,9 +87,13 @@ def worker_entry(
     DBOS.launch()
 
     async def enqueue_batch() -> int:
-        # Fire all enqueues in this batch concurrently. Discard handles.
+        # Fire all enqueues in this batch concurrently. Each workflow goes to a
+        # randomly chosen queue. Discard handles.
         await asyncio.gather(
-            *(queue.enqueue_async(noop_workflow) for _ in range(enqueue_batch_size))
+            *(
+                random.choice(queues).enqueue_async(noop_workflow)
+                for _ in range(enqueue_batch_size)
+            )
         )
         return enqueue_batch_size
 
@@ -157,6 +168,7 @@ def run_multiprocess(
     pool_size: int,
     executor_threads: int,
     processes: int,
+    num_queues: int,
 ) -> None:
     asyncio.run(recreate_database())
 
@@ -184,6 +196,7 @@ def run_multiprocess(
                 enqueue_batch_size,
                 pool_size,
                 executor_threads,
+                num_queues,
                 enqueue_done_barrier,
                 done_barrier,
                 result_queue,
@@ -205,6 +218,7 @@ def run_multiprocess(
     completion_rps = enqueued / total_time if total_time > 0 else 0
 
     print(f"Processes:        {processes}")
+    print(f"Queues:           {num_queues}")
     print(f"Target RPS:       {total_rps}  ({per_proc_rps}/proc)")
     print(f"Enqueue batch:    {enqueue_batch_size}")
     print(f"Pool size/proc:   {pool_size}")
@@ -244,6 +258,12 @@ def main() -> None:
     parser.add_argument(
         "--processes", type=int, default=4, help="Number of worker processes"
     )
+    parser.add_argument(
+        "--queues",
+        type=int,
+        default=1,
+        help="Number of queue shards (workers are assigned round-robin)",
+    )
     args = parser.parse_args()
     run_multiprocess(
         args.rps,
@@ -252,6 +272,7 @@ def main() -> None:
         args.pool_size,
         args.executor_threads,
         args.processes,
+        args.queues,
     )
 
 

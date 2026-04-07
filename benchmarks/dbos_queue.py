@@ -40,6 +40,7 @@ def worker_entry(
     batch_size: int,
     pool_size: int,
     executor_threads: int,
+    done_barrier,
     result_queue: mp.Queue,
 ) -> None:
     # All DBOS code lives inside the worker process.
@@ -104,9 +105,6 @@ def worker_entry(
             drain_latencies.append(time.monotonic() - t0)
             completed = end
         drain_end = time.monotonic()
-        
-        # Drain active workflows on this process
-        await asyncio.sleep(5)
 
         return {
             "enqueued": len(handles),
@@ -120,9 +118,13 @@ def worker_entry(
 
     try:
         result = asyncio.run(run())
+        result_queue.put(result)
+        # Stay alive (executor still running) until every worker has finished
+        # its drain phase, so other workers' workflows can still be picked up
+        # by this process's executor.
+        done_barrier.wait()
     finally:
         DBOS.destroy()
-    result_queue.put(result)
 
 
 def run_multiprocess(
@@ -139,6 +141,7 @@ def run_multiprocess(
 
     ctx = mp.get_context("spawn")
     result_queue: mp.Queue = ctx.Queue()
+    done_barrier = ctx.Barrier(processes)
     workers = []
     for _ in range(processes):
         p = ctx.Process(
@@ -149,6 +152,7 @@ def run_multiprocess(
                 batch_size,
                 pool_size,
                 executor_threads,
+                done_barrier,
                 result_queue,
             ),
         )

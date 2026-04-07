@@ -58,7 +58,8 @@ def worker_entry(
     async def start_batch(latencies: list[float]) -> None:
         t0 = time.monotonic()
         for _ in range(batch_size):
-            await DBOS.start_workflow_async(noop_workflow)
+            handle = await DBOS.start_workflow_async(noop_workflow)
+            await handle.get_result()
         latencies.append(time.monotonic() - t0)
 
     async def run() -> dict:

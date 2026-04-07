@@ -8,6 +8,7 @@ import argparse
 import asyncio
 import multiprocessing as mp
 import os
+import sys
 import time
 from urllib.parse import urlparse
 import uuid
@@ -65,7 +66,7 @@ def worker_entry(
     async def noop_workflow() -> int:
         return 1
 
-    queue = Queue("bench-queue", polling_interval_sec=0.00001)
+    queue = Queue("bench-queue", polling_interval_sec=sys.float_info.min)
 
     config: DBOSConfig = {
         "name": "dbos-queue-bench",

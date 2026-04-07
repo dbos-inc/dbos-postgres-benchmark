@@ -321,7 +321,7 @@ def main() -> None:
         help="Concurrent enqueues per batch (Phase 1)",
     )
     parser.add_argument(
-        "--pool-size", type=int, default=3, help="DBOS system DB pool size per process"
+        "--pool-size", type=int, default=2, help="DBOS system DB pool size per process"
     )
     parser.add_argument(
         "--executor-threads",
@@ -330,7 +330,7 @@ def main() -> None:
         help="DBOS max_executor_threads per process",
     )
     parser.add_argument(
-        "--processes", type=int, default=64, help="Number of worker processes"
+        "--processes", type=int, default=128, help="Number of worker processes"
     )
     parser.add_argument(
         "--queues",

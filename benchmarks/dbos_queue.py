@@ -17,6 +17,14 @@ import uuid
 import asyncpg
 
 
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round(pct / 100 * (len(s) - 1)))))
+    return s[k]
+
+
 async def recreate_database() -> None:
     """Drop and recreate the benchmark database via POSTGRES_DATABASE_URL."""
     admin_url = os.environ["POSTGRES_DATABASE_URL"]
@@ -58,6 +66,7 @@ def worker_entry(
     pool_size: int,
     executor_threads: int,
     num_queues: int,
+    sample_rate: float,
     enqueue_done_barrier,
     done_barrier,
     result_queue: mp.Queue,
@@ -95,15 +104,19 @@ def worker_entry(
     DBOS.listen_queues(listen)
     DBOS.launch()
 
+    # samples: list of (workflow_id, start_wallclock_seconds) for latency lookup.
+    samples: list[tuple[str, float]] = []
+
+    async def enqueue_one() -> None:
+        sampled = random.random() < sample_rate
+        start = time.time() if sampled else 0.0
+        handle = await random.choice(queues).enqueue_async(noop_workflow)
+        if sampled:
+            samples.append((handle.workflow_id, start))
+
     async def enqueue_batch() -> int:
-        # Fire all enqueues in this batch concurrently. Each workflow goes to a
-        # randomly chosen queue. Discard handles.
-        await asyncio.gather(
-            *(
-                random.choice(queues).enqueue_async(noop_workflow)
-                for _ in range(enqueue_batch_size)
-            )
-        )
+        # Fire all enqueues in this batch concurrently.
+        await asyncio.gather(*(enqueue_one() for _ in range(enqueue_batch_size)))
         return enqueue_batch_size
 
     async def run() -> dict:
@@ -153,19 +166,42 @@ def worker_entry(
                 flush=True,
             )
 
+        # Sync so all workers wait until drain finishes before looking up samples.
+        done_barrier.wait()
+
+        # --- Latency lookup: for each sampled workflow, fetch updated_at ---
+        latencies: list[float] = []
+        if samples:
+            conn = await asyncpg.connect(os.environ["BENCHMARK_DATABASE_URL"])
+            try:
+                ids = [s[0] for s in samples]
+                rows = await conn.fetch(
+                    "SELECT workflow_uuid, updated_at FROM dbos.workflow_status "
+                    "WHERE workflow_uuid = ANY($1::text[])",
+                    ids,
+                )
+            finally:
+                await conn.close()
+            updated_at_by_id = {r["workflow_uuid"]: r["updated_at"] for r in rows}
+            for wf_id, start in samples:
+                ua = updated_at_by_id.get(wf_id)
+                if ua is None:
+                    continue
+                # updated_at is epoch milliseconds
+                completed_at_s = float(ua) / 1000.0
+                latencies.append(completed_at_s - start)
+
         return {
             "enqueued": enqueued,
             "enqueue_failures": enqueue_failures,
             "enqueue_time": enqueue_end - enqueue_start,
             "drain_time": drain_time,
+            "latencies": latencies,
         }
 
     try:
         result = asyncio.run(run())
         result_queue.put(result)
-        # Stay alive (executor still running) until every worker has finished,
-        # so other workers' workflows can still be picked up by this executor.
-        done_barrier.wait()
     finally:
         DBOS.destroy()
 
@@ -178,6 +214,7 @@ def run_multiprocess(
     executor_threads: int,
     processes: int,
     num_queues: int,
+    sample_rate: float,
 ) -> None:
     asyncio.run(recreate_database())
 
@@ -207,6 +244,7 @@ def run_multiprocess(
                 pool_size,
                 executor_threads,
                 num_queues,
+                sample_rate,
                 enqueue_done_barrier,
                 done_barrier,
                 result_queue,
@@ -226,6 +264,9 @@ def run_multiprocess(
     total_time = enqueue_time + drain_time
     enqueue_rps = enqueued / enqueue_time if enqueue_time > 0 else 0
     completion_rps = enqueued / total_time if total_time > 0 else 0
+    all_latencies: list[float] = []
+    for r in results:
+        all_latencies.extend(r["latencies"])
 
     print(f"Processes:        {processes}")
     print(f"Queues:           {num_queues}")
@@ -240,6 +281,14 @@ def run_multiprocess(
     print(f"Enqueue failures: {enqueue_failures}")
     print(f"Enqueue RPS:      {enqueue_rps:.0f}")
     print(f"Completion RPS:   {completion_rps:.0f}   (end-to-end)")
+    if all_latencies:
+        print(
+            f"Latency samples:  {len(all_latencies)}   "
+            f"p50={percentile(all_latencies, 50)*1000:.1f}ms "
+            f"p95={percentile(all_latencies, 95)*1000:.1f}ms "
+            f"p99={percentile(all_latencies, 99)*1000:.1f}ms "
+            f"max={max(all_latencies)*1000:.1f}ms"
+        )
 
 
 def main() -> None:
@@ -274,6 +323,12 @@ def main() -> None:
         default=1,
         help="Number of queue shards (workers are assigned round-robin)",
     )
+    parser.add_argument(
+        "--sample-rate",
+        type=float,
+        default=0.01,
+        help="Fraction of workflows sampled for latency measurement (default 0.01)",
+    )
     args = parser.parse_args()
     run_multiprocess(
         args.rps,
@@ -283,6 +338,7 @@ def main() -> None:
         args.executor_threads,
         args.processes,
         args.queues,
+        args.sample_rate,
     )
 
 

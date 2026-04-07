@@ -103,6 +103,7 @@ resource "aws_db_instance" "postgres" {
 # --- EC2 (c7i.48xlarge) ---
 
 resource "aws_instance" "bench" {
+  count                       = 2
   ami                         = "ami-04eaa218f1349d88b" # Ubuntu 24.04 LTS amd64 us-east-1
   instance_type               = "c7i.48xlarge"
   vpc_security_group_ids      = [aws_security_group.ec2.id]
@@ -135,14 +136,14 @@ resource "aws_instance" "bench" {
     ENVEOF
   EOF
 
-  tags = { Name = "dbos-bench-ec2" }
+  tags = { Name = "dbos-bench-ec2-${count.index}" }
 }
 
 # --- Outputs ---
 
-output "ec2_public_ip" {
-  description = "Public IP of the benchmark EC2 instance"
-  value       = aws_instance.bench.public_ip
+output "ec2_public_ips" {
+  description = "Public IPs of the benchmark EC2 instances"
+  value       = aws_instance.bench[*].public_ip
 }
 
 output "rds_endpoint" {

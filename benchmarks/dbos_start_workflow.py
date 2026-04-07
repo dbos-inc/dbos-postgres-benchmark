@@ -131,7 +131,9 @@ def worker_entry(
         )
 
         # Wait for every worker to finish starting before measuring drain.
-        start_done_barrier.wait()
+        # Run the synchronous barrier in a thread so in-flight workflows on
+        # this worker's event loop can continue making progress.
+        await asyncio.to_thread(start_done_barrier.wait)
 
         # --- Phase 2: drain (worker 0 polls list_workflows) ---
         # Worker 0 polls until no PENDING workflows remain. Other workers just
@@ -152,7 +154,7 @@ def worker_entry(
             )
 
         # Sync so all workers wait until drain finishes before looking up samples.
-        done_barrier.wait()
+        await asyncio.to_thread(done_barrier.wait)
 
         # --- Latency lookup: for each sampled workflow, fetch updated_at ---
         latencies: list[float] = []

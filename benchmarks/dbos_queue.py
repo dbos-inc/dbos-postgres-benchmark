@@ -64,7 +64,7 @@ def worker_entry(
     async def noop_workflow() -> int:
         return 1
 
-    queue = Queue("bench-queue", polling_interval_sec=0.1)
+    queue = Queue("bench-queue", polling_interval_sec=0.00001)
 
     config: DBOSConfig = {
         "name": "dbos-queue-bench",
@@ -230,7 +230,7 @@ def main() -> None:
     parser.add_argument(
         "--drain-batch",
         type=int,
-        default=1,
+        default=100,
         help="Handles per drain batch, awaited sequentially (Phase 2)",
     )
     parser.add_argument(

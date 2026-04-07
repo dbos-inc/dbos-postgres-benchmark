@@ -197,7 +197,7 @@ def main() -> None:
         "--pool-size", type=int, default=32, help="asyncpg pool size per process"
     )
     parser.add_argument(
-        "--processes", type=int, default=8, help="Number of worker processes"
+        "--processes", type=int, default=16, help="Number of worker processes"
     )
     args = parser.parse_args()
     run_multiprocess(

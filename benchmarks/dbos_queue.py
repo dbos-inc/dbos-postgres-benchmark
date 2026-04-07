@@ -10,6 +10,7 @@ import multiprocessing as mp
 import os
 import time
 from urllib.parse import urlparse
+import uuid
 
 import asyncpg
 
@@ -63,7 +64,7 @@ def worker_entry(
     async def noop_workflow() -> int:
         return 1
 
-    queue = Queue("bench-queue")
+    queue = Queue("bench-queue", worker_concurrency=100)
 
     config: DBOSConfig = {
         "name": "dbos-queue-bench",
@@ -71,6 +72,7 @@ def worker_entry(
         "run_admin_server": False,
         "sys_db_pool_size": pool_size,
         "max_executor_threads": executor_threads,
+        "executor_id": str(uuid.uuid7()),
     }
     DBOS(config=config)
     DBOS.launch()

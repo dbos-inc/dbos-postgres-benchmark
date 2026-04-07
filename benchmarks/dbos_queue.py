@@ -34,6 +34,26 @@ def percentile(values: list[float], pct: float) -> float:
     return s[k]
 
 
+def bootstrap_schema_entry() -> None:
+    """Pre-create the DBOS system schema in a one-shot subprocess.
+
+    Runs in its own spawned process so the parent never imports DBOS.
+    Pre-running migrations eliminates the per-worker advisory-lock serialization
+    when many workers launch in parallel.
+    """
+    from dbos import DBOS, DBOSConfig
+
+    config: DBOSConfig = {
+        "name": "dbos-queue-bench-bootstrap",
+        "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
+        "run_admin_server": False,
+        "sys_db_pool_size": 2,
+    }
+    DBOS(config=config)
+    DBOS.launch()
+    DBOS.destroy()
+
+
 def worker_entry(
     target_rps: int,
     duration_s: float,
@@ -140,6 +160,13 @@ def run_multiprocess(
     per_proc_rps = total_rps // processes
 
     ctx = mp.get_context("spawn")
+
+    # Pre-create the DBOS schema in a single child so workers don't serialize
+    # on the migration advisory lock.
+    bootstrap = ctx.Process(target=bootstrap_schema_entry)
+    bootstrap.start()
+    bootstrap.join()
+
     result_queue: mp.Queue = ctx.Queue()
     done_barrier = ctx.Barrier(processes)
     workers = []
@@ -211,7 +238,7 @@ def main() -> None:
         "--batch-size", type=int, default=100, help="Concurrent enqueues per batch"
     )
     parser.add_argument(
-        "--pool-size", type=int, default=32, help="DBOS system DB pool size per process"
+        "--pool-size", type=int, default=16, help="DBOS system DB pool size per process"
     )
     parser.add_argument(
         "--executor-threads",

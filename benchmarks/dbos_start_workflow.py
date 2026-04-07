@@ -36,6 +36,7 @@ def worker_entry(
     duration_s: float,
     batch_size: int,
     pool_size: int,
+    executor_threads: int,
     result_queue: mp.Queue,
 ) -> None:
     # All DBOS code lives inside the worker process.
@@ -50,6 +51,7 @@ def worker_entry(
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": pool_size,
+        "max_executor_threads": executor_threads,
         "executor_id": str(uuid.uuid7()),
     }
     DBOS(config=config)
@@ -57,10 +59,9 @@ def worker_entry(
 
     async def start_batch(latencies: list[float]) -> None:
         t0 = time.monotonic()
-        handles = [
-            await DBOS.start_workflow_async(noop_workflow)
-            for _ in range(batch_size)
-        ]
+        handles = await asyncio.gather(
+            *(DBOS.start_workflow_async(noop_workflow) for _ in range(batch_size))
+        )
         await asyncio.gather(*(h.get_result() for h in handles))
         latencies.append(time.monotonic() - t0)
 
@@ -117,6 +118,7 @@ def run_multiprocess(
     duration_s: float,
     batch_size: int,
     pool_size: int,
+    executor_threads: int,
     processes: int,
 ) -> None:
     asyncio.run(recreate_database())
@@ -129,7 +131,14 @@ def run_multiprocess(
     for _ in range(processes):
         p = ctx.Process(
             target=worker_entry,
-            args=(per_proc_rps, duration_s, batch_size, pool_size, result_queue),
+            args=(
+                per_proc_rps,
+                duration_s,
+                batch_size,
+                pool_size,
+                executor_threads,
+                result_queue,
+            ),
         )
         p.start()
         workers.append(p)
@@ -150,20 +159,21 @@ def run_multiprocess(
     for r in results:
         all_latencies.extend(r["latencies"])
 
-    print(f"Processes:       {processes}")
-    print(f"Target RPS:      {total_rps}  ({per_proc_rps}/proc)")
-    print(f"Batch size:      {batch_size}")
-    print(f"Pool size/proc:  {pool_size}")
-    print(f"Schedule time:   {schedule_time:.2f}s")
-    print(f"Drain time:      {drain_time:.2f}s   (>0 means DBOS couldn't keep up)")
-    print(f"Total elapsed:   {elapsed:.2f}s")
-    print(f"Batches OK:      {completed}")
-    print(f"Batches FAIL:    {failed}")
-    print(f"Total starts:    {total_starts}")
-    print(f"Actual RPS:      {actual_rps:.0f}")
+    print(f"Processes:        {processes}")
+    print(f"Target RPS:       {total_rps}  ({per_proc_rps}/proc)")
+    print(f"Batch size:       {batch_size}")
+    print(f"Pool size/proc:   {pool_size}")
+    print(f"Exec threads/proc:{executor_threads}")
+    print(f"Schedule time:    {schedule_time:.2f}s")
+    print(f"Drain time:       {drain_time:.2f}s   (>0 means DBOS couldn't keep up)")
+    print(f"Total elapsed:    {elapsed:.2f}s")
+    print(f"Batches OK:       {completed}")
+    print(f"Batches FAIL:     {failed}")
+    print(f"Total starts:     {total_starts}")
+    print(f"Actual RPS:       {actual_rps:.0f}")
     if all_latencies:
         print(
-            "Batch latency:   "
+            "Batch latency:    "
             f"p50={percentile(all_latencies, 50)*1000:.1f}ms "
             f"p95={percentile(all_latencies, 95)*1000:.1f}ms "
             f"p99={percentile(all_latencies, 99)*1000:.1f}ms "
@@ -180,17 +190,28 @@ def main() -> None:
         "--duration", type=float, default=30.0, help="Run duration in seconds"
     )
     parser.add_argument(
-        "--batch-size", type=int, default=10, help="Workflow starts per batch"
+        "--batch-size", type=int, default=100, help="Workflow starts per batch"
     )
     parser.add_argument(
         "--pool-size", type=int, default=64, help="DBOS system DB pool size per process"
+    )
+    parser.add_argument(
+        "--executor-threads",
+        type=int,
+        default=512,
+        help="DBOS max_executor_threads per process",
     )
     parser.add_argument(
         "--processes", type=int, default=4, help="Number of worker processes"
     )
     args = parser.parse_args()
     run_multiprocess(
-        args.rps, args.duration, args.batch_size, args.pool_size, args.processes
+        args.rps,
+        args.duration,
+        args.batch_size,
+        args.pool_size,
+        args.executor_threads,
+        args.processes,
     )
 
 

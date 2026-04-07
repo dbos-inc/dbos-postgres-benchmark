@@ -1,14 +1,27 @@
-"""Benchmark DBOS start_workflow_async throughput at a target rate."""
+"""Benchmark DBOS start_workflow_async throughput at a target rate.
+
+Two-phase: start all workflows at the target rate, then drain all completions.
+Reports start and end-to-end completion throughput, plus sampled latency.
+"""
 
 import argparse
 import asyncio
 import multiprocessing as mp
 import os
+import random
 import time
 import uuid
 from urllib.parse import urlparse
 
 import asyncpg
+
+
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = max(0, min(len(s) - 1, int(round(pct / 100 * (len(s) - 1)))))
+    return s[k]
 
 
 async def recreate_database() -> None:
@@ -21,14 +34,6 @@ async def recreate_database() -> None:
         await conn.execute(f'CREATE DATABASE "{bench_db}"')
     finally:
         await conn.close()
-
-
-def percentile(values: list[float], pct: float) -> float:
-    if not values:
-        return 0.0
-    s = sorted(values)
-    k = max(0, min(len(s) - 1, int(round(pct / 100 * (len(s) - 1)))))
-    return s[k]
 
 
 def bootstrap_schema_entry() -> None:
@@ -52,19 +57,23 @@ def bootstrap_schema_entry() -> None:
 
 
 def worker_entry(
+    worker_id: int,
     target_rps: int,
     duration_s: float,
-    batch_size: int,
+    start_batch_size: int,
     pool_size: int,
     executor_threads: int,
+    sample_rate: float,
+    start_done_barrier,
+    done_barrier,
     result_queue: mp.Queue,
 ) -> None:
     # All DBOS code lives inside the worker process.
     from dbos import DBOS, DBOSConfig
 
     @DBOS.workflow()
-    async def noop_workflow() -> None:
-        pass
+    async def noop_workflow() -> int:
+        return 1
 
     config: DBOSConfig = {
         "name": "dbos-bench",
@@ -77,72 +86,121 @@ def worker_entry(
     DBOS(config=config)
     DBOS.launch()
 
-    async def one_workflow(latencies: list[float]) -> None:
-        t0 = time.monotonic()
-        handle = await DBOS.start_workflow_async(noop_workflow)
-        await handle.get_result()
-        latencies.append(time.monotonic() - t0)
+    # samples: list of (workflow_id, start_wallclock_seconds) for latency lookup.
+    samples: list[tuple[str, float]] = []
 
-    async def start_batch(latencies: list[float]) -> None:
-        await asyncio.gather(
-            *(one_workflow(latencies) for _ in range(batch_size))
-        )
+    async def start_one() -> None:
+        sampled = random.random() < sample_rate
+        start = time.time() if sampled else 0.0
+        handle = await DBOS.start_workflow_async(noop_workflow)
+        if sampled:
+            samples.append((handle.workflow_id, start))
+
+    async def start_batch() -> int:
+        # Fire all starts in this batch concurrently.
+        await asyncio.gather(*(start_one() for _ in range(start_batch_size)))
+        return start_batch_size
 
     async def run() -> dict:
-        batches_per_second = target_rps / batch_size
+        batches_per_second = target_rps / start_batch_size
         interval = 1.0 / batches_per_second
         total_batches = int(batches_per_second * duration_s)
 
-        completed = 0
-        failed = 0
-        latencies: list[float] = []
-        tasks: set[asyncio.Task] = set()
+        started = 0
+        start_failures = 0
 
-        def on_done(task: asyncio.Task) -> None:
-            nonlocal completed, failed
-            tasks.discard(task)
-            if task.exception() is not None:
-                failed += 1
-            else:
-                completed += 1
-
-        start = time.monotonic()
+        # --- Phase 1: start workflows at target rate ---
+        # Record wall-clock start/end so the parent can compute elapsed across
+        # all workers as (last end - first start).
+        start_start_wall = time.time()
+        loop_start = time.monotonic()
         for i in range(total_batches):
-            target_time = start + i * interval
+            target_time = loop_start + i * interval
             now = time.monotonic()
             if target_time > now:
                 await asyncio.sleep(target_time - now)
-            task = asyncio.create_task(start_batch(latencies))
-            task.add_done_callback(on_done)
-            tasks.add(task)
-        schedule_done = time.monotonic()
+            try:
+                started += await start_batch()
+            except Exception:
+                start_failures += 1
+        start_end_wall = time.time()
+        print(
+            f"[pid {os.getpid()}] start done: "
+            f"{started} workflows in {start_end_wall - start_start_wall:.2f}s",
+            flush=True,
+        )
 
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        elapsed = time.monotonic() - start
+        # Wait for every worker to finish starting before measuring drain.
+        start_done_barrier.wait()
+
+        # --- Phase 2: drain (worker 0 polls list_workflows) ---
+        # Worker 0 polls until no PENDING workflows remain. Other workers just
+        # wait. This avoids per-handle get_result polling pressure on the
+        # system DB.
+        drain_start_wall = time.time()
+        drain_end_wall = drain_start_wall
+        if worker_id == 0:
+            while True:
+                unfinished = await DBOS.list_workflows_async(status="PENDING", limit=1)
+                if not unfinished:
+                    break
+                await asyncio.sleep(0.1)
+            drain_end_wall = time.time()
+            print(
+                f"[pid {os.getpid()}] drain done in {drain_end_wall - drain_start_wall:.2f}s",
+                flush=True,
+            )
+
+        # Sync so all workers wait until drain finishes before looking up samples.
+        done_barrier.wait()
+
+        # --- Latency lookup: for each sampled workflow, fetch updated_at ---
+        latencies: list[float] = []
+        if samples:
+            conn = await asyncpg.connect(os.environ["BENCHMARK_DATABASE_URL"])
+            try:
+                ids = [s[0] for s in samples]
+                rows = await conn.fetch(
+                    "SELECT workflow_uuid, updated_at FROM dbos.workflow_status "
+                    "WHERE workflow_uuid = ANY($1::text[])",
+                    ids,
+                )
+            finally:
+                await conn.close()
+            updated_at_by_id = {r["workflow_uuid"]: r["updated_at"] for r in rows}
+            for wf_id, start in samples:
+                ua = updated_at_by_id.get(wf_id)
+                if ua is None:
+                    continue
+                # updated_at is epoch milliseconds
+                completed_at_s = float(ua) / 1000.0
+                latencies.append(completed_at_s - start)
 
         return {
-            "completed": completed,
-            "failed": failed,
-            "schedule_time": schedule_done - start,
-            "elapsed": elapsed,
+            "started": started,
+            "start_failures": start_failures,
+            "start_start_wall": start_start_wall,
+            "start_end_wall": start_end_wall,
+            "drain_start_wall": drain_start_wall,
+            "drain_end_wall": drain_end_wall,
             "latencies": latencies,
         }
 
     try:
         result = asyncio.run(run())
+        result_queue.put(result)
     finally:
         DBOS.destroy()
-    result_queue.put(result)
 
 
 def run_multiprocess(
     total_rps: int,
     duration_s: float,
-    batch_size: int,
+    start_batch_size: int,
     pool_size: int,
     executor_threads: int,
     processes: int,
+    sample_rate: float,
 ) -> None:
     asyncio.run(recreate_database())
 
@@ -157,16 +215,22 @@ def run_multiprocess(
     bootstrap.join()
 
     result_queue: mp.Queue = ctx.Queue()
+    start_done_barrier = ctx.Barrier(processes)
+    done_barrier = ctx.Barrier(processes)
     workers = []
-    for _ in range(processes):
+    for worker_id in range(processes):
         p = ctx.Process(
             target=worker_entry,
             args=(
+                worker_id,
                 per_proc_rps,
                 duration_s,
-                batch_size,
+                start_batch_size,
                 pool_size,
                 executor_threads,
+                sample_rate,
+                start_done_barrier,
+                done_barrier,
                 result_queue,
             ),
         )
@@ -177,33 +241,35 @@ def run_multiprocess(
     for p in workers:
         p.join()
 
-    completed = sum(r["completed"] for r in results)
-    failed = sum(r["failed"] for r in results)
-    schedule_time = max(r["schedule_time"] for r in results)
-    elapsed = max(r["elapsed"] for r in results)
-    drain_time = elapsed - schedule_time
-    total_starts = completed * batch_size
-    actual_rps = total_starts / elapsed
-
+    started = sum(r["started"] for r in results)
+    start_failures = sum(r["start_failures"] for r in results)
+    first_start = min(r["start_start_wall"] for r in results)
+    last_start_end = max(r["start_end_wall"] for r in results)
+    last_drain_end = max(r["drain_end_wall"] for r in results)
+    start_time = last_start_end - first_start
+    drain_time = last_drain_end - last_start_end
+    total_time = last_drain_end - first_start
+    start_rps = started / start_time if start_time > 0 else 0
+    completion_rps = started / total_time if total_time > 0 else 0
     all_latencies: list[float] = []
     for r in results:
         all_latencies.extend(r["latencies"])
 
     print(f"Processes:        {processes}")
     print(f"Target RPS:       {total_rps}  ({per_proc_rps}/proc)")
-    print(f"Batch size:       {batch_size}")
+    print(f"Start batch:      {start_batch_size}")
     print(f"Pool size/proc:   {pool_size}")
     print(f"Exec threads/proc:{executor_threads}")
-    print(f"Schedule time:    {schedule_time:.2f}s")
-    print(f"Drain time:       {drain_time:.2f}s   (>0 means DBOS couldn't keep up)")
-    print(f"Total elapsed:    {elapsed:.2f}s")
-    print(f"Batches OK:       {completed}")
-    print(f"Batches FAIL:     {failed}")
-    print(f"Total starts:     {total_starts}")
-    print(f"Actual RPS:       {actual_rps:.0f}")
+    print(f"Start time:       {start_time:.2f}s")
+    print(f"Drain time:       {drain_time:.2f}s")
+    print(f"Total time:       {total_time:.2f}s")
+    print(f"Started:          {started}")
+    print(f"Start failures:   {start_failures}")
+    print(f"Start RPS:        {start_rps:.0f}")
+    print(f"Completion RPS:   {completion_rps:.0f}   (end-to-end)")
     if all_latencies:
         print(
-            "Workflow latency: "
+            f"Latency samples:  {len(all_latencies)}   "
             f"p50={percentile(all_latencies, 50)*1000:.1f}ms "
             f"p95={percentile(all_latencies, 95)*1000:.1f}ms "
             f"p99={percentile(all_latencies, 99)*1000:.1f}ms "
@@ -217,10 +283,13 @@ def main() -> None:
         "--rps", type=int, required=True, help="Total target workflow starts per second"
     )
     parser.add_argument(
-        "--duration", type=float, default=30.0, help="Run duration in seconds"
+        "--duration", type=float, default=30.0, help="Start phase duration in seconds"
     )
     parser.add_argument(
-        "--batch-size", type=int, default=100, help="Workflow starts per batch"
+        "--start-batch",
+        type=int,
+        default=100,
+        help="Concurrent starts per batch (Phase 1)",
     )
     parser.add_argument(
         "--pool-size", type=int, default=16, help="DBOS system DB pool size per process"
@@ -234,14 +303,21 @@ def main() -> None:
     parser.add_argument(
         "--processes", type=int, default=4, help="Number of worker processes"
     )
+    parser.add_argument(
+        "--sample-rate",
+        type=float,
+        default=0.01,
+        help="Fraction of workflows sampled for latency measurement (default 0.01)",
+    )
     args = parser.parse_args()
     run_multiprocess(
         args.rps,
         args.duration,
-        args.batch_size,
+        args.start_batch,
         args.pool_size,
         args.executor_threads,
         args.processes,
+        args.sample_rate,
     )
 
 

@@ -93,10 +93,14 @@ def worker_entry(
         interval = 1.0 / batches_per_second
         total_batches = int(batches_per_second * duration_s)
 
-        handles: list = []
+        wait_tasks: list[asyncio.Task] = []
         enqueue_failures = 0
 
-        # --- Phase 1: enqueue at target rate ---
+        async def wait_one(h, enqueue_t: float) -> float:
+            await h.get_result()
+            return time.monotonic() - enqueue_t
+
+        # --- Phase 1: enqueue at target rate, fire a wait task per handle ---
         enqueue_start = time.monotonic()
         for i in range(total_batches):
             target_time = enqueue_start + i * interval
@@ -105,35 +109,28 @@ def worker_entry(
                 await asyncio.sleep(target_time - now)
             try:
                 batch_handles = await enqueue_batch()
-                handles.extend(batch_handles)
+                t = time.monotonic()
+                for h in batch_handles:
+                    wait_tasks.append(asyncio.create_task(wait_one(h, t)))
             except Exception:
                 enqueue_failures += 1
         enqueue_end = time.monotonic()
 
         # --- Phase 2: drain all completions ---
-        # Wait for results in chunks so we can measure progress.
-        drain_latencies: list[float] = []
-        completed = 0
-        chunk = 100
-        while completed < len(handles):
-            end = min(completed + chunk, len(handles))
-            t0 = time.monotonic()
-            await asyncio.gather(
-                *(h.get_result() for h in handles[completed:end]),
-                return_exceptions=True,
-            )
-            drain_latencies.append(time.monotonic() - t0)
-            completed = end
+        results = await asyncio.gather(*wait_tasks, return_exceptions=True)
         drain_end = time.monotonic()
 
+        latencies = [r for r in results if isinstance(r, float)]
+        completed = len(latencies)
+
         return {
-            "enqueued": len(handles),
+            "enqueued": len(wait_tasks),
             "enqueue_failures": enqueue_failures,
             "completed": completed,
             "enqueue_time": enqueue_end - enqueue_start,
             "drain_time": drain_end - enqueue_end,
             "total_time": drain_end - enqueue_start,
-            "drain_chunk_latencies": drain_latencies,
+            "latencies": latencies,
         }
 
     try:
@@ -199,9 +196,9 @@ def run_multiprocess(
     enqueue_rps = enqueued / enqueue_time if enqueue_time > 0 else 0
     completion_rps = completed / total_time if total_time > 0 else 0
 
-    all_drain_latencies: list[float] = []
+    all_latencies: list[float] = []
     for r in results:
-        all_drain_latencies.extend(r["drain_chunk_latencies"])
+        all_latencies.extend(r["latencies"])
 
     print(f"Processes:        {processes}")
     print(f"Target RPS:       {total_rps}  ({per_proc_rps}/proc)")
@@ -216,13 +213,13 @@ def run_multiprocess(
     print(f"Enqueue failures: {enqueue_failures}")
     print(f"Enqueue RPS:      {enqueue_rps:.0f}")
     print(f"Completion RPS:   {completion_rps:.0f}   (end-to-end)")
-    if all_drain_latencies:
+    if all_latencies:
         print(
-            "Drain chunk lat:  "
-            f"p50={percentile(all_drain_latencies, 50)*1000:.1f}ms "
-            f"p95={percentile(all_drain_latencies, 95)*1000:.1f}ms "
-            f"p99={percentile(all_drain_latencies, 99)*1000:.1f}ms "
-            f"max={max(all_drain_latencies)*1000:.1f}ms"
+            "Workflow latency: "
+            f"p50={percentile(all_latencies, 50)*1000:.1f}ms "
+            f"p95={percentile(all_latencies, 95)*1000:.1f}ms "
+            f"p99={percentile(all_latencies, 99)*1000:.1f}ms "
+            f"max={max(all_latencies)*1000:.1f}ms"
         )
 
 

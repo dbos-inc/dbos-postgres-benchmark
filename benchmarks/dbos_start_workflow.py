@@ -77,13 +77,16 @@ def worker_entry(
     DBOS(config=config)
     DBOS.launch()
 
-    async def start_batch(latencies: list[float]) -> None:
+    async def one_workflow(latencies: list[float]) -> None:
         t0 = time.monotonic()
-        handles = await asyncio.gather(
-            *(DBOS.start_workflow_async(noop_workflow) for _ in range(batch_size))
-        )
-        await asyncio.gather(*(h.get_result() for h in handles))
+        handle = await DBOS.start_workflow_async(noop_workflow)
+        await handle.get_result()
         latencies.append(time.monotonic() - t0)
+
+    async def start_batch(latencies: list[float]) -> None:
+        await asyncio.gather(
+            *(one_workflow(latencies) for _ in range(batch_size))
+        )
 
     async def run() -> dict:
         batches_per_second = target_rps / batch_size
@@ -200,7 +203,7 @@ def run_multiprocess(
     print(f"Actual RPS:       {actual_rps:.0f}")
     if all_latencies:
         print(
-            "Batch latency:    "
+            "Workflow latency: "
             f"p50={percentile(all_latencies, 50)*1000:.1f}ms "
             f"p95={percentile(all_latencies, 95)*1000:.1f}ms "
             f"p99={percentile(all_latencies, 99)*1000:.1f}ms "

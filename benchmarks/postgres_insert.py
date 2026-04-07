@@ -186,11 +186,19 @@ def run_multiprocess(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rps", type=int, required=True, help="Total target inserts per second")
-    parser.add_argument("--duration", type=float, default=30.0, help="Run duration in seconds")
+    parser.add_argument(
+        "--rps", type=int, required=True, help="Total target inserts per second"
+    )
+    parser.add_argument(
+        "--duration", type=float, default=30.0, help="Run duration in seconds"
+    )
     parser.add_argument("--batch-size", type=int, default=10, help="Inserts per batch")
-    parser.add_argument("--pool-size", type=int, default=32, help="asyncpg pool size per process")
-    parser.add_argument("--processes", type=int, default=4, help="Number of worker processes")
+    parser.add_argument(
+        "--pool-size", type=int, default=32, help="asyncpg pool size per process"
+    )
+    parser.add_argument(
+        "--processes", type=int, default=4, help="Number of worker processes"
+    )
     args = parser.parse_args()
     run_multiprocess(
         args.rps, args.duration, args.batch_size, args.pool_size, args.processes

@@ -294,7 +294,7 @@ def main() -> None:
         help="Concurrent starts per batch (Phase 1)",
     )
     parser.add_argument(
-        "--pool-size", type=int, default=3, help="DBOS system DB pool size per process"
+        "--pool-size", type=int, default=2, help="DBOS system DB pool size per process"
     )
     parser.add_argument(
         "--executor-threads",

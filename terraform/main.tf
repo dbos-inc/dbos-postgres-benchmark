@@ -75,14 +75,14 @@ resource "aws_security_group" "rds" {
   tags = { Name = "dbos-bench-rds-sg" }
 }
 
-# --- RDS (db.m7i.24xlarge) ---
+# --- RDS (db.m7i.2xlarge) ---
 
 resource "aws_db_instance" "postgres" {
   identifier     = "dbos-bench-postgres"
   engine         = "postgres"
   engine_version = "16"
 
-  instance_class          = "db.m7i.24xlarge"
+  instance_class          = "db.m7i.2xlarge"
   allocated_storage       = 300
   storage_type            = "io2"
   iops                    = 120000
@@ -103,7 +103,7 @@ resource "aws_db_instance" "postgres" {
 # --- EC2 (c7i.48xlarge) ---
 
 resource "aws_instance" "bench" {
-  count                       = 2
+  count                       = 1
   ami                         = "ami-04eaa218f1349d88b" # Ubuntu 24.04 LTS amd64 us-east-1
   instance_type               = "c7i.48xlarge"
   vpc_security_group_ids      = [aws_security_group.ec2.id]

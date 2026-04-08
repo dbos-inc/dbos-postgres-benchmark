@@ -25,7 +25,7 @@ def percentile(values: list[float], pct: float) -> float:
     return s[k]
 
 
-async def recreate_database(sync_commit_off: bool) -> None:
+async def recreate_database() -> None:
     """Drop and recreate the benchmark database via POSTGRES_DATABASE_URL."""
     admin_url = os.environ["POSTGRES_DATABASE_URL"]
     bench_db = urlparse(os.environ["BENCHMARK_DATABASE_URL"]).path.lstrip("/")
@@ -33,10 +33,6 @@ async def recreate_database(sync_commit_off: bool) -> None:
     try:
         await conn.execute(f'DROP DATABASE IF EXISTS "{bench_db}" WITH (FORCE)')
         await conn.execute(f'CREATE DATABASE "{bench_db}"')
-        if sync_commit_off:
-            await conn.execute(
-                f'ALTER DATABASE "{bench_db}" SET synchronous_commit = off'
-            )
     finally:
         await conn.close()
 
@@ -226,9 +222,8 @@ def run_multiprocess(
     processes: int,
     num_queues: int,
     sample_rate: float,
-    sync_commit_off: bool,
 ) -> None:
-    asyncio.run(recreate_database(sync_commit_off))
+    asyncio.run(recreate_database())
 
     per_proc_rps = total_rps // processes
 
@@ -344,11 +339,6 @@ def main() -> None:
         default=0.01,
         help="Fraction of workflows sampled for latency measurement (default 0.01)",
     )
-    parser.add_argument(
-        "--sync-commit-off",
-        action="store_true",
-        help="Set synchronous_commit = off on the benchmark database",
-    )
     args = parser.parse_args()
     run_multiprocess(
         args.rps,
@@ -359,7 +349,6 @@ def main() -> None:
         args.processes,
         args.queues,
         args.sample_rate,
-        args.sync_commit_off,
     )
 
 

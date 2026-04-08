@@ -303,7 +303,7 @@ def main() -> None:
         help="DBOS max_executor_threads per process",
     )
     parser.add_argument(
-        "--processes", type=int, default=64, help="Number of worker processes"
+        "--processes", type=int, default=256, help="Number of worker processes"
     )
     parser.add_argument(
         "--sample-rate",

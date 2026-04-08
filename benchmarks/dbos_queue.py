@@ -11,8 +11,8 @@ import os
 import random
 import sys
 import time
-from urllib.parse import urlparse
 import uuid
+from urllib.parse import urlparse
 
 import asyncpg
 
@@ -87,9 +87,9 @@ def worker_entry(
 
     # Partition listening across workers. num_queues must divide num_workers,
     # so each queue is listened to by exactly num_workers // num_queues workers.
-    assert num_workers % num_queues == 0, (
-        f"num_queues ({num_queues}) must divide num_workers ({num_workers})"
-    )
+    assert (
+        num_workers % num_queues == 0
+    ), f"num_queues ({num_queues}) must divide num_workers ({num_workers})"
     listen = [queues[worker_id % num_queues]]
 
     config: DBOSConfig = {
@@ -161,7 +161,9 @@ def worker_entry(
         drain_end_wall = drain_start_wall
         if worker_id == 0:
             while True:
-                unfinished = await DBOS.list_workflows_async(status=["PENDING", "ENQUEUED"], limit=1)
+                unfinished = await DBOS.list_workflows_async(
+                    status=["PENDING", "ENQUEUED"], limit=1
+                )
                 if not unfinished:
                     break
                 await asyncio.sleep(0.1)
@@ -304,7 +306,10 @@ def run_multiprocess(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--rps", type=int, required=True, help="Total target enqueue rate (workflows/sec)"
+        "--rps",
+        type=int,
+        required=True,
+        help="Total target enqueue rate (workflows/sec)",
     )
     parser.add_argument(
         "--duration", type=float, default=30.0, help="Enqueue phase duration in seconds"

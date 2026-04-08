@@ -75,14 +75,14 @@ resource "aws_security_group" "rds" {
   tags = { Name = "dbos-bench-rds-sg" }
 }
 
-# --- RDS (db.m7i.2xlarge) ---
+# --- RDS (db.m7i.24xlarge) ---
 
 resource "aws_db_instance" "postgres" {
   identifier     = "dbos-bench-postgres"
   engine         = "postgres"
   engine_version = "16"
 
-  instance_class          = "db.m7i.2xlarge"
+  instance_class          = "db.m7i.24xlarge"
   allocated_storage       = 300
   storage_type            = "io2"
   iops                    = 120000

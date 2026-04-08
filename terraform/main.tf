@@ -83,9 +83,9 @@ resource "aws_db_instance" "postgres" {
   engine_version = "16"
 
   instance_class          = "db.m7i.2xlarge"
-  allocated_storage       = 100
+  allocated_storage       = 300
   storage_type            = "io2"
-  iops                    = 40000
+  iops                    = 120000
   db_name                 = "postgres"
   username                = local.db_username
   password                = local.db_password
@@ -94,6 +94,7 @@ resource "aws_db_instance" "postgres" {
   publicly_accessible     = false
   skip_final_snapshot     = true
   backup_retention_period = 0
+  apply_immediately       = true
   vpc_security_group_ids  = [aws_security_group.rds.id]
 
   tags = { Name = "dbos-bench-postgres" }
@@ -102,6 +103,7 @@ resource "aws_db_instance" "postgres" {
 # --- EC2 (c7i.48xlarge) ---
 
 resource "aws_instance" "bench" {
+  count                       = 1
   ami                         = "ami-04eaa218f1349d88b" # Ubuntu 24.04 LTS amd64 us-east-1
   instance_type               = "c7i.48xlarge"
   vpc_security_group_ids      = [aws_security_group.ec2.id]
@@ -134,14 +136,14 @@ resource "aws_instance" "bench" {
     ENVEOF
   EOF
 
-  tags = { Name = "dbos-bench-ec2" }
+  tags = { Name = "dbos-bench-ec2-${count.index}" }
 }
 
 # --- Outputs ---
 
-output "ec2_public_ip" {
-  description = "Public IP of the benchmark EC2 instance"
-  value       = aws_instance.bench.public_ip
+output "ec2_public_ips" {
+  description = "Public IPs of the benchmark EC2 instances"
+  value       = aws_instance.bench[*].public_ip
 }
 
 output "rds_endpoint" {

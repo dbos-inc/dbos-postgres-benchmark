@@ -150,7 +150,6 @@ def worker_entry(
         DBOS.logger.info(
             f"[pid {os.getpid()}] enqueue done: "
             f"{enqueued} workflows in {enqueue_end_wall - enqueue_start_wall:.2f}s",
-            flush=True,
         )
 
         # Wait for every worker to finish enqueueing before measuring drain.
@@ -175,7 +174,6 @@ def worker_entry(
             drain_end_wall = time.time()
             DBOS.logger.info(
                 f"[pid {os.getpid()}] drain done in {drain_end_wall - drain_start_wall:.2f}s",
-                flush=True,
             )
 
         # Sync so all workers wait until drain finishes before looking up samples.

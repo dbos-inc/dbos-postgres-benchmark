@@ -82,7 +82,7 @@ def worker_entry(
     # Create all queues in every worker so any worker can enqueue to any queue.
     # Workflows are enqueued to a random queue per call.
     queues = [
-        Queue(f"bench-queue-{i}", worker_concurrency=1000)
+        Queue(f"bench-queue-{i}", worker_concurrency=1000, polling_interval_sec=0.1)
         for i in range(num_queues)
     ]
 

@@ -67,6 +67,7 @@ def worker_entry(
     executor_threads: int,
     num_queues: int,
     sample_rate: float,
+    ready_barrier,
     enqueue_done_barrier,
     done_barrier,
     result_queue: mp.Queue,
@@ -103,6 +104,9 @@ def worker_entry(
     DBOS(config=config)
     DBOS.listen_queues(listen)
     DBOS.launch()
+
+    # Wait until all processes are started before beginning the benchmark.
+    ready_barrier.wait()
 
     # samples: list of (workflow_id, start_wallclock_seconds) for latency lookup.
     samples: list[tuple[str, float]] = []
@@ -238,6 +242,7 @@ def run_multiprocess(
     bootstrap.join()
 
     result_queue: mp.Queue = ctx.Queue()
+    ready_barrier = ctx.Barrier(processes)
     enqueue_done_barrier = ctx.Barrier(processes)
     done_barrier = ctx.Barrier(processes)
     workers = []
@@ -254,6 +259,7 @@ def run_multiprocess(
                 executor_threads,
                 num_queues,
                 sample_rate,
+                ready_barrier,
                 enqueue_done_barrier,
                 done_barrier,
                 result_queue,

@@ -67,6 +67,7 @@ def worker_entry(
     executor_threads: int,
     num_queues: int,
     sample_rate: float,
+    ready_barrier,
     enqueue_done_barrier,
     done_barrier,
     result_queue: mp.Queue,
@@ -81,8 +82,7 @@ def worker_entry(
     # Create all queues in every worker so any worker can enqueue to any queue.
     # Workflows are enqueued to a random queue per call.
     queues = [
-        Queue(f"bench-queue-{i}", polling_interval_sec=sys.float_info.min)
-        for i in range(num_queues)
+        Queue(f"bench-queue-{i}", worker_concurrency=1000) for i in range(num_queues)
     ]
 
     # Partition listening across workers. num_queues must divide num_workers,
@@ -104,6 +104,9 @@ def worker_entry(
     DBOS.listen_queues(listen)
     DBOS.launch()
 
+    # Wait until all processes are started before beginning the benchmark.
+    ready_barrier.wait()
+
     # samples: list of (workflow_id, start_wallclock_seconds) for latency lookup.
     samples: list[tuple[str, float]] = []
 
@@ -120,6 +123,7 @@ def worker_entry(
         return enqueue_batch_size
 
     async def run() -> dict:
+        DBOS.logger.info(f"Starting enqueue for worker {worker_id}")
         batches_per_second = target_rps / enqueue_batch_size
         interval = 1.0 / batches_per_second
         total_batches = int(batches_per_second * duration_s)
@@ -142,10 +146,9 @@ def worker_entry(
             except Exception:
                 enqueue_failures += 1
         enqueue_end_wall = time.time()
-        print(
+        DBOS.logger.info(
             f"[pid {os.getpid()}] enqueue done: "
             f"{enqueued} workflows in {enqueue_end_wall - enqueue_start_wall:.2f}s",
-            flush=True,
         )
 
         # Wait for every worker to finish enqueueing before measuring drain.
@@ -168,9 +171,8 @@ def worker_entry(
                     break
                 await asyncio.sleep(0.1)
             drain_end_wall = time.time()
-            print(
+            DBOS.logger.info(
                 f"[pid {os.getpid()}] drain done in {drain_end_wall - drain_start_wall:.2f}s",
-                flush=True,
             )
 
         # Sync so all workers wait until drain finishes before looking up samples.
@@ -238,6 +240,7 @@ def run_multiprocess(
     bootstrap.join()
 
     result_queue: mp.Queue = ctx.Queue()
+    ready_barrier = ctx.Barrier(processes)
     enqueue_done_barrier = ctx.Barrier(processes)
     done_barrier = ctx.Barrier(processes)
     workers = []
@@ -254,6 +257,7 @@ def run_multiprocess(
                 executor_threads,
                 num_queues,
                 sample_rate,
+                ready_barrier,
                 enqueue_done_barrier,
                 done_barrier,
                 result_queue,

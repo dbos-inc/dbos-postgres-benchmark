@@ -23,17 +23,17 @@ uv sync
 ### Postgres insert throughput
 
 ```bash
-uv run python benchmarks/postgres_insert.py --rps 5000 --duration 30
+uv run python benchmarks/postgres_insert.py --rps 1000 --duration 300
 ```
 
 ### DBOS start_workflow throughput
 
 ```bash
-uv run python benchmarks/dbos_start_workflow.py --rps 5000 --duration 30
+uv run python benchmarks/dbos_start_workflow.py --rps 1000 --duration 300
 ```
 
 ### DBOS queue throughput
 
 ```bash
-uv run python benchmarks/dbos_queue.py --rps 5000 --duration 30
+uv run python benchmarks/dbos_queue.py --rps 1000 --duration 300
 ```

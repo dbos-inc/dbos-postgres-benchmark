@@ -124,6 +124,7 @@ def worker_entry(
         return enqueue_batch_size
 
     async def run() -> dict:
+        DBOS.logger.info(f"Starting enqueue for worker {worker_id}")
         batches_per_second = target_rps / enqueue_batch_size
         interval = 1.0 / batches_per_second
         total_batches = int(batches_per_second * duration_s)
@@ -146,7 +147,7 @@ def worker_entry(
             except Exception:
                 enqueue_failures += 1
         enqueue_end_wall = time.time()
-        print(
+        DBOS.logger.info(
             f"[pid {os.getpid()}] enqueue done: "
             f"{enqueued} workflows in {enqueue_end_wall - enqueue_start_wall:.2f}s",
             flush=True,
@@ -172,7 +173,7 @@ def worker_entry(
                     break
                 await asyncio.sleep(0.1)
             drain_end_wall = time.time()
-            print(
+            DBOS.logger.info(
                 f"[pid {os.getpid()}] drain done in {drain_end_wall - drain_start_wall:.2f}s",
                 flush=True,
             )

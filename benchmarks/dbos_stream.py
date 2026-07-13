@@ -72,6 +72,15 @@ def pin_db_hosts_to_ip() -> None:
         print(f"Pinned {host} -> {ip} for {var}", flush=True)
 
 
+def stream_identity(worker_id: int, stream_index: int) -> tuple[str, str]:
+    """(workflow_id, stream key) for a producer stream.
+
+    Deterministic so reader processes can address any stream by computing its id
+    instead of discovering the producer's auto-generated workflow id.
+    """
+    return f"prod-{worker_id}-{stream_index}", "data"
+
+
 def percentile(values: list[float], pct: float) -> float:
     if not values:
         return 0.0
@@ -139,14 +148,24 @@ def worker_entry(
     sample_rate: float,
     max_samples: int,
     use_listen_notify: bool,
+    embed_timestamp: bool,
     ready_barrier,
     launched_barrier,
     result_queue: mp.Queue,
 ) -> None:
     # All DBOS code lives inside the worker process.
-    from dbos import DBOS, DBOSConfig
+    from dbos import DBOS, DBOSConfig, SetWorkflowID
 
-    payload = "x" * payload_size
+    static_payload = "x" * payload_size
+
+    def make_value() -> str:
+        # When readers are present, prefix each value with the write wall-clock
+        # time so a reader can measure end-to-end (write->read) latency. Padded
+        # back to ~payload_size. Otherwise use the precomputed static payload.
+        if not embed_timestamp:
+            return static_payload
+        prefix = f"{time.time():.6f}|"
+        return prefix + "x" * max(0, payload_size - len(prefix))
 
     @DBOS.step()
     async def stream_writer(key: str, start_epoch: float) -> dict:
@@ -168,7 +187,7 @@ def worker_entry(
             sampled = len(latencies) < max_samples and random.random() < sample_rate
             t0 = time.monotonic() if sampled else 0.0
             try:
-                await DBOS.write_stream_async(key, payload)
+                await DBOS.write_stream_async(key, make_value())
             except Exception:
                 failures += 1
                 return
@@ -233,12 +252,16 @@ def worker_entry(
         await asyncio.to_thread(launched_barrier.wait)
         start_epoch = start_epoch_value.value
 
-        # Launch one producer workflow per stream. start_workflow_async returns
-        # quickly (a row insert); each producer then sleeps until start_epoch.
-        keys = [f"w{worker_id}-s{i}" for i in range(streams_per_worker)]
-        handles = [
-            await DBOS.start_workflow_async(producer, key, start_epoch) for key in keys
-        ]
+        # Launch one producer workflow per stream with a deterministic id so
+        # reader processes can find it. start_workflow_async returns quickly (a
+        # row insert); each producer then sleeps until start_epoch.
+        handles = []
+        for i in range(streams_per_worker):
+            wfid, key = stream_identity(worker_id, i)
+            with SetWorkflowID(wfid):
+                handles.append(
+                    await DBOS.start_workflow_async(producer, key, start_epoch)
+                )
         results = await asyncio.gather(*(h.get_result() for h in handles))
 
         count = sum(r["count"] for r in results)
@@ -260,6 +283,124 @@ def worker_entry(
     try:
         result = asyncio.run(run())
         result_queue.put(result)
+    finally:
+        DBOS.destroy()
+
+
+def reader_entry(
+    reader_id: int,
+    reader_processes: int,
+    processes: int,
+    streams_per_worker: int,
+    fanout: int,
+    start_epoch_value,
+    duration_s: float,
+    drain_timeout: float,
+    pool_size: int,
+    executor_threads: int,
+    sample_rate: float,
+    max_samples: int,
+    use_listen_notify: bool,
+    ready_barrier,
+    launched_barrier,
+    read_result_queue: mp.Queue,
+) -> None:
+    # All DBOS code lives inside the reader process.
+    from dbos import DBOS, DBOSConfig
+
+    # Build this process's slice of the consumer list. Every stream has `fanout`
+    # consumers; consumer global index c is handled by reader c % reader_processes.
+    consumers: list[tuple[str, str]] = []
+    gidx = 0
+    for w in range(processes):
+        for i in range(streams_per_worker):
+            wfid, key = stream_identity(w, i)
+            for _ in range(fanout):
+                if gidx % reader_processes == reader_id:
+                    consumers.append((wfid, key))
+                gidx += 1
+
+    config: DBOSConfig = {
+        "name": "dbos-stream-bench-reader",
+        "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
+        "run_admin_server": False,
+        "sys_db_pool_size": pool_size,
+        "max_executor_threads": executor_threads,
+        "executor_id": str(uuid.uuid7()),
+        "use_listen_notify": use_listen_notify,
+    }
+    DBOS(config=config)
+    DBOS.launch()
+
+    async def consume(wfid: str, key: str, start_epoch: float, hard_deadline: float):
+        now = time.time()
+        if start_epoch > now:
+            await asyncio.sleep(start_epoch - now)
+
+        # Wait for the producer workflow to exist before streaming: read_stream's
+        # first empty read calls get_status(), which raises for a missing workflow
+        # (readers and producers start together, so this races the producer launch).
+        while time.time() < hard_deadline:
+            try:
+                await (await DBOS.retrieve_workflow_async(wfid)).get_status()
+                break
+            except Exception:
+                await asyncio.sleep(0.05)
+
+        count = 0
+        failed = 0
+        first_read = 0.0
+        last_read = 0.0
+        latencies: list[float] = []
+        try:
+            async for value in DBOS.read_stream_async(wfid, key, offset=0):
+                recv = time.time()
+                count += 1
+                if first_read == 0.0:
+                    first_read = recv
+                last_read = recv
+                if len(latencies) < max_samples and random.random() < sample_rate:
+                    try:
+                        latencies.append(recv - float(value.split("|", 1)[0]))
+                    except ValueError, IndexError:
+                        pass
+                if recv > hard_deadline:
+                    break
+        except Exception:
+            failed = 1
+        return {
+            "count": count,
+            "failed": failed,
+            "first_read": first_read,
+            "last_read": last_read,
+            "latencies": latencies,
+        }
+
+    async def run() -> dict:
+        await asyncio.to_thread(ready_barrier.wait)
+        await asyncio.to_thread(launched_barrier.wait)
+        start_epoch = start_epoch_value.value
+        hard_deadline = start_epoch + duration_s + drain_timeout
+
+        results = await asyncio.gather(
+            *(consume(wfid, key, start_epoch, hard_deadline) for wfid, key in consumers)
+        )
+
+        latencies: list[float] = []
+        for r in results:
+            latencies.extend(r["latencies"])
+        firsts = [r["first_read"] for r in results if r["first_read"] > 0]
+        lasts = [r["last_read"] for r in results if r["last_read"] > 0]
+        return {
+            "count": sum(r["count"] for r in results),
+            "failed": sum(r["failed"] for r in results),
+            "first_read": min(firsts) if firsts else 0.0,
+            "last_read": max(lasts) if lasts else 0.0,
+            "latencies": latencies,
+        }
+
+    try:
+        read_result_queue.put(asyncio.run(run()))
     finally:
         DBOS.destroy()
 
@@ -288,6 +429,11 @@ def run_multiprocess(
     max_samples: int,
     start_grace: float,
     use_listen_notify: bool,
+    reader_processes: int,
+    fanout: int,
+    reader_pool_size: int,
+    reader_executor_threads: int,
+    read_drain_timeout: float,
 ) -> None:
     # Pin DB hostnames to IPs before any connection is opened, so the many
     # worker processes don't storm the local DNS resolver (see the function).
@@ -306,12 +452,20 @@ def run_multiprocess(
 
     total_streams = processes * streams_per_worker
     per_producer_rps = (total_rps / total_streams) if total_rps > 0 else 0.0
+    readers_on = reader_processes > 0 and fanout > 0
+    # Producers embed a write timestamp in each value only when readers will
+    # consume it (to measure end-to-end latency) — it costs work on the hot path.
+    embed_timestamp = readers_on
 
     result_queue: mp.Queue = ctx.Queue()
+    read_result_queue: mp.Queue = ctx.Queue()
     start_epoch_value = ctx.Value("d", 0.0)
-    # +1 participant: the coordinator that sets start_epoch between the barriers.
-    ready_barrier = ctx.Barrier(processes + 1)
-    launched_barrier = ctx.Barrier(processes + 1)
+    # Participants at the barriers: producers + readers + 1 coordinator that sets
+    # start_epoch between the two barriers.
+    n_readers = reader_processes if readers_on else 0
+    parties = processes + n_readers + 1
+    ready_barrier = ctx.Barrier(parties)
+    launched_barrier = ctx.Barrier(parties)
 
     coordinator = ctx.Process(
         target=set_start_epoch_entry,
@@ -335,6 +489,7 @@ def run_multiprocess(
                 sample_rate,
                 max_samples,
                 use_listen_notify,
+                embed_timestamp,
                 ready_barrier,
                 launched_barrier,
                 result_queue,
@@ -343,8 +498,37 @@ def run_multiprocess(
         p.start()
         workers.append(p)
 
+    readers = []
+    for reader_id in range(n_readers):
+        p = ctx.Process(
+            target=reader_entry,
+            args=(
+                reader_id,
+                n_readers,
+                processes,
+                streams_per_worker,
+                fanout,
+                start_epoch_value,
+                duration_s,
+                read_drain_timeout,
+                reader_pool_size,
+                reader_executor_threads,
+                sample_rate,
+                max_samples,
+                use_listen_notify,
+                ready_barrier,
+                launched_barrier,
+                read_result_queue,
+            ),
+        )
+        p.start()
+        readers.append(p)
+
     results = [result_queue.get() for _ in workers]
+    read_results = [read_result_queue.get() for _ in readers]
     for p in workers:
+        p.join()
+    for p in readers:
         p.join()
     coordinator.join()
 
@@ -397,6 +581,41 @@ def run_multiprocess(
             f"p99={percentile(all_latencies, 99)*1000:.2f}ms "
             f"max={max(all_latencies)*1000:.2f}ms"
         )
+
+    if readers_on:
+        read = sum(r["count"] for r in read_results)
+        read_failures = sum(r["failed"] for r in read_results)
+        r_firsts = [r["first_read"] for r in read_results if r["first_read"] > 0]
+        r_lasts = [r["last_read"] for r in read_results if r["last_read"] > 0]
+        read_span = (max(r_lasts) - min(r_firsts)) if r_firsts and r_lasts else 0.0
+        reads_per_sec = read / read_span if read_span > 0 else 0.0
+        expected = written * fanout  # each written value read once per fanout reader
+        coverage = read / expected if expected > 0 else 0.0
+        e2e: list[float] = []
+        for r in read_results:
+            e2e.extend(r["latencies"])
+        total_conns = processes * pool_size + reader_processes * reader_pool_size
+
+        print(f"Reader procs:      {reader_processes}")
+        print(f"Fanout:            {fanout}   (readers/stream)")
+        print(
+            f"Reader pool/proc:  {reader_pool_size}   (total DB conns ~= {total_conns})"
+        )
+        print(f"Reads:             {read}")
+        print(f"Read failures:     {read_failures}")
+        print(
+            f"Coverage:          {coverage:.3f}   (reads / writes*fanout; 1.0 = all delivered)"
+        )
+        print(f"Read span:         {read_span:.2f}s")
+        print(f"Reads/sec:         {reads_per_sec:.0f}   (aggregate, over read span)")
+        if e2e:
+            print(
+                f"E2E latency:       samples={len(e2e)}   "
+                f"p50={percentile(e2e, 50)*1000:.2f}ms "
+                f"p95={percentile(e2e, 95)*1000:.2f}ms "
+                f"p99={percentile(e2e, 99)*1000:.2f}ms "
+                f"max={max(e2e)*1000:.2f}ms   (write commit -> read delivery)"
+            )
 
 
 def main() -> None:
@@ -464,6 +683,38 @@ def main() -> None:
         help="Use LISTEN/NOTIFY (default on). --no-listen-notify drops the "
         "streams pg_notify trigger to isolate raw insert throughput",
     )
+    parser.add_argument(
+        "--reader-processes",
+        type=int,
+        default=0,
+        help="Number of separate reader processes (0 = writers only, the default)",
+    )
+    parser.add_argument(
+        "--fanout",
+        type=int,
+        default=1,
+        help="Readers per stream (default 1). Read QPS = fanout * write QPS",
+    )
+    parser.add_argument(
+        "--reader-pool-size",
+        type=int,
+        default=0,
+        help="DBOS system DB pool size per reader process "
+        "(0 = auto: consumers-per-reader + 4)",
+    )
+    parser.add_argument(
+        "--reader-executor-threads",
+        type=int,
+        default=0,
+        help="DBOS max_executor_threads per reader process "
+        "(0 = auto: max(64, consumers-per-reader * 2))",
+    )
+    parser.add_argument(
+        "--read-drain-timeout",
+        type=float,
+        default=60.0,
+        help="Extra seconds past the window for readers to drain backlog (default 60)",
+    )
     args = parser.parse_args()
 
     pool_size = args.pool_size if args.pool_size > 0 else args.streams_per_worker + 4
@@ -471,6 +722,21 @@ def main() -> None:
         args.executor_threads
         if args.executor_threads > 0
         else max(64, args.streams_per_worker * 2)
+    )
+
+    # Size reader pools/threads to how many stream consumers each reader runs.
+    readers_on = args.reader_processes > 0 and args.fanout > 0
+    total_consumers = args.processes * args.streams_per_worker * args.fanout
+    consumers_per_reader = (
+        -(-total_consumers // args.reader_processes) if readers_on else 0
+    )
+    reader_pool_size = (
+        args.reader_pool_size if args.reader_pool_size > 0 else consumers_per_reader + 4
+    )
+    reader_executor_threads = (
+        args.reader_executor_threads
+        if args.reader_executor_threads > 0
+        else max(64, consumers_per_reader * 2)
     )
 
     run_multiprocess(
@@ -485,6 +751,11 @@ def main() -> None:
         args.max_samples,
         args.start_grace,
         args.listen_notify,
+        args.reader_processes,
+        args.fanout,
+        reader_pool_size,
+        reader_executor_threads,
+        args.read_drain_timeout,
     )
 
 

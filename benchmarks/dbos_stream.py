@@ -17,14 +17,59 @@ flat out).
 
 import argparse
 import asyncio
+import ipaddress
 import multiprocessing as mp
 import os
 import random
+import socket
 import time
 import uuid
 from urllib.parse import urlparse
 
 import asyncpg
+
+
+def pin_db_hosts_to_ip() -> None:
+    """Resolve the DB hostnames once and rewrite the URLs to their IPs.
+
+    Many worker processes each open a connection pool plus DBOS background
+    threads (notification listener, scheduler, queue poller), all calling
+    getaddrinfo() on the same RDS hostname at once. That overwhelms the local
+    stub resolver, which returns intermittent EAI_AGAIN ("Temporary failure in
+    name resolution"). Resolving once here and connecting by IP eliminates all
+    per-connection DNS lookups; spawned workers inherit the rewritten os.environ.
+
+    No-op if the host is already an IP or cannot be resolved. RDS default
+    sslmode does not verify the hostname, so connecting by IP is safe.
+    """
+    for var in ("POSTGRES_DATABASE_URL", "BENCHMARK_DATABASE_URL"):
+        url = os.environ.get(var)
+        if not url:
+            continue
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if host is None:
+            continue
+        try:
+            ipaddress.ip_address(host)
+            continue  # already a literal IP
+        except ValueError:
+            pass
+        try:
+            ip = socket.gethostbyname(host)
+        except OSError as e:
+            print(f"warning: could not resolve {host} for {var}: {e}", flush=True)
+            continue
+        # Swap only the host token in the netloc, preserving credentials and
+        # port exactly (raw, so no risk of re-encoding the password).
+        netloc = parsed.netloc
+        at = netloc.rfind("@")
+        creds = netloc[: at + 1]  # "user:pass@" or "" if no credentials
+        hostport = netloc[at + 1 :]
+        port = hostport.rsplit(":", 1)[1] if ":" in hostport else None
+        new_netloc = creds + (f"{ip}:{port}" if port else ip)
+        os.environ[var] = parsed._replace(netloc=new_netloc).geturl()
+        print(f"Pinned {host} -> {ip} for {var}", flush=True)
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -236,6 +281,10 @@ def run_multiprocess(
     max_samples: int,
     start_grace: float,
 ) -> None:
+    # Pin DB hostnames to IPs before any connection is opened, so the many
+    # worker processes don't storm the local DNS resolver (see the function).
+    pin_db_hosts_to_ip()
+
     asyncio.run(recreate_database())
 
     ctx = mp.get_context("spawn")
@@ -368,7 +417,7 @@ def main() -> None:
         type=int,
         default=0,
         help="DBOS system DB pool size per process "
-        "(0 = auto: streams-per-worker + 2)",
+        "(0 = auto: streams-per-worker + 4)",
     )
     parser.add_argument(
         "--executor-threads",
@@ -397,7 +446,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    pool_size = args.pool_size if args.pool_size > 0 else args.streams_per_worker + 2
+    pool_size = args.pool_size if args.pool_size > 0 else args.streams_per_worker + 4
     executor_threads = (
         args.executor_threads
         if args.executor_threads > 0

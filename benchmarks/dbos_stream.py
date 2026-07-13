@@ -92,13 +92,17 @@ async def recreate_database() -> None:
         await conn.close()
 
 
-def bootstrap_schema_entry() -> None:
+def bootstrap_schema_entry(use_listen_notify: bool) -> None:
     """Pre-create the DBOS system schema (incl. streams table + trigger) in a
     one-shot subprocess.
 
     Runs in its own spawned process so the parent never imports DBOS.
     Pre-running migrations eliminates the per-worker advisory-lock serialization
     when many workers launch in parallel.
+
+    use_listen_notify is decided here: with it False the migrations skip the
+    streams AFTER INSERT trigger, so writes avoid a per-row pg_notify. Workers
+    must use the same value (it cannot change after the schema is created).
     """
     from dbos import DBOS, DBOSConfig
 
@@ -107,6 +111,7 @@ def bootstrap_schema_entry() -> None:
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": 2,
+        "use_listen_notify": use_listen_notify,
     }
     DBOS(config=config)
     DBOS.launch()
@@ -133,6 +138,7 @@ def worker_entry(
     executor_threads: int,
     sample_rate: float,
     max_samples: int,
+    use_listen_notify: bool,
     ready_barrier,
     launched_barrier,
     result_queue: mp.Queue,
@@ -211,6 +217,7 @@ def worker_entry(
         "sys_db_pool_size": pool_size,
         "max_executor_threads": executor_threads,
         "executor_id": str(uuid.uuid7()),
+        "use_listen_notify": use_listen_notify,
     }
     DBOS(config=config)
     DBOS.launch()
@@ -280,6 +287,7 @@ def run_multiprocess(
     sample_rate: float,
     max_samples: int,
     start_grace: float,
+    use_listen_notify: bool,
 ) -> None:
     # Pin DB hostnames to IPs before any connection is opened, so the many
     # worker processes don't storm the local DNS resolver (see the function).
@@ -290,8 +298,9 @@ def run_multiprocess(
     ctx = mp.get_context("spawn")
 
     # Pre-create the DBOS schema in a single child so workers don't serialize
-    # on the migration advisory lock.
-    bootstrap = ctx.Process(target=bootstrap_schema_entry)
+    # on the migration advisory lock. This also fixes whether the streams
+    # pg_notify trigger exists, so workers must match use_listen_notify.
+    bootstrap = ctx.Process(target=bootstrap_schema_entry, args=(use_listen_notify,))
     bootstrap.start()
     bootstrap.join()
 
@@ -325,6 +334,7 @@ def run_multiprocess(
                 executor_threads,
                 sample_rate,
                 max_samples,
+                use_listen_notify,
                 ready_barrier,
                 launched_barrier,
                 result_queue,
@@ -369,6 +379,9 @@ def run_multiprocess(
         f"Pool size/proc:    {pool_size}   (total DB conns ~= {processes * pool_size})"
     )
     print(f"Exec threads/proc: {executor_threads}")
+    print(
+        f"LISTEN/NOTIFY:     {'on' if use_listen_notify else 'off (no write trigger)'}"
+    )
     print(f"Window:            {duration_s:.2f}s")
     print(f"Measured span:     {measured_span:.2f}s   (should be ~= window)")
     print(f"Late start:        {late_start:.2f}s   (>~0.5s: raise --start-grace)")
@@ -444,6 +457,13 @@ def main() -> None:
         default=5.0,
         help="Seconds between launch and synchronized write start (default 5)",
     )
+    parser.add_argument(
+        "--listen-notify",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use LISTEN/NOTIFY (default on). --no-listen-notify drops the "
+        "streams pg_notify trigger to isolate raw insert throughput",
+    )
     args = parser.parse_args()
 
     pool_size = args.pool_size if args.pool_size > 0 else args.streams_per_worker + 4
@@ -464,6 +484,7 @@ def main() -> None:
         args.sample_rate,
         args.max_samples,
         args.start_grace,
+        args.listen_notify,
     )
 
 

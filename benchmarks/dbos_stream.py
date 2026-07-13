@@ -142,6 +142,7 @@ def worker_entry(
     start_epoch_value,
     duration_s: float,
     per_producer_rps: float,
+    jitter: float,
     payload_size: int,
     pool_size: int,
     executor_threads: int,
@@ -200,11 +201,16 @@ def worker_entry(
                 latencies.append(time.monotonic() - t0)
 
         if per_producer_rps > 0:
-            # Paced: schedule writes at a fixed interval within the window.
+            # Paced: schedule writes at a fixed interval. Offset this producer's
+            # schedule by a random phase within `jitter` fraction of the interval
+            # so producers don't all fire in lockstep -- lockstep bursts the DB
+            # every interval and inflates latency even at low average rates.
+            # jitter=0 reproduces the old synchronized ticks.
             interval = 1.0 / per_producer_rps
+            phase = random.random() * interval * jitter
             i = 0
             while True:
-                target = start_epoch + i * interval
+                target = start_epoch + phase + i * interval
                 if target >= deadline:
                     break
                 now = time.time()
@@ -422,6 +428,7 @@ def run_multiprocess(
     streams_per_worker: int,
     duration_s: float,
     total_rps: int,
+    jitter: float,
     payload_size: int,
     pool_size: int,
     executor_threads: int,
@@ -483,6 +490,7 @@ def run_multiprocess(
                 start_epoch_value,
                 duration_s,
                 per_producer_rps,
+                jitter,
                 payload_size,
                 pool_size,
                 executor_threads,
@@ -561,6 +569,7 @@ def run_multiprocess(
     print(f"Mode:              {'paced' if total_rps > 0 else 'flat-out'}")
     if total_rps > 0:
         print(f"Target RPS:        {total_rps}  ({per_producer_rps:.1f}/stream)")
+        print(f"Jitter:            {jitter:.2f}   (fraction of interval, 0 = lockstep)")
     print(
         f"Pool size/proc:    {pool_size}   (total DB conns ~= {processes * pool_size})"
     )
@@ -642,6 +651,14 @@ def main() -> None:
         type=int,
         default=0,
         help="Target aggregate writes/sec (0 = flat out, the default)",
+    )
+    parser.add_argument(
+        "--jitter",
+        type=float,
+        default=1.0,
+        help="Paced mode: randomize each producer's phase over this fraction of "
+        "the write interval so they don't fire in lockstep (default 1.0 = full "
+        "interval; 0 = synchronized). No effect in flat-out mode",
     )
     parser.add_argument(
         "--payload-size",
@@ -748,6 +765,7 @@ def main() -> None:
         args.streams_per_worker,
         args.duration,
         args.rps,
+        args.jitter,
         args.payload_size,
         pool_size,
         executor_threads,

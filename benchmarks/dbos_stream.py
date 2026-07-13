@@ -648,8 +648,9 @@ def main() -> None:
         "--pool-size",
         type=int,
         default=0,
-        help="DBOS system DB pool size per process "
-        "(0 = auto: streams-per-worker + 4)",
+        help="DBOS system DB pool size per process, applied to producers AND "
+        "readers (0 = auto: producers streams-per-worker+4, readers "
+        "consumers-per-reader+4)",
     )
     parser.add_argument(
         "--executor-threads",
@@ -696,13 +697,6 @@ def main() -> None:
         help="Readers per stream (default 1). Read QPS = fanout * write QPS",
     )
     parser.add_argument(
-        "--reader-pool-size",
-        type=int,
-        default=0,
-        help="DBOS system DB pool size per reader process "
-        "(0 = auto: consumers-per-reader + 4)",
-    )
-    parser.add_argument(
         "--reader-executor-threads",
         type=int,
         default=0,
@@ -717,21 +711,26 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    pool_size = args.pool_size if args.pool_size > 0 else args.streams_per_worker + 4
-    executor_threads = (
-        args.executor_threads
-        if args.executor_threads > 0
-        else max(64, args.streams_per_worker * 2)
-    )
-
-    # Size reader pools/threads to how many stream consumers each reader runs.
     readers_on = args.reader_processes > 0 and args.fanout > 0
     total_consumers = args.processes * args.streams_per_worker * args.fanout
     consumers_per_reader = (
         -(-total_consumers // args.reader_processes) if readers_on else 0
     )
-    reader_pool_size = (
-        args.reader_pool_size if args.reader_pool_size > 0 else consumers_per_reader + 4
+
+    # --pool-size applies to both producer and reader processes: when set (>0)
+    # both use that value; when auto (0) each role is sized to its own
+    # concurrency (producers to streams-per-worker, readers to consumers-per-reader).
+    if args.pool_size > 0:
+        pool_size = args.pool_size
+        reader_pool_size = args.pool_size
+    else:
+        pool_size = args.streams_per_worker + 4
+        reader_pool_size = consumers_per_reader + 4
+
+    executor_threads = (
+        args.executor_threads
+        if args.executor_threads > 0
+        else max(64, args.streams_per_worker * 2)
     )
     reader_executor_threads = (
         args.reader_executor_threads

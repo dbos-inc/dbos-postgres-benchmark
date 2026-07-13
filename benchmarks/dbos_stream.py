@@ -539,11 +539,13 @@ def run_multiprocess(
     lasts = [r["last_write"] for r in results if r["last_write"] > 0]
     first_write = min(firsts) if firsts else start_epoch
     last_write = max(lasts) if lasts else start_epoch
-    measured_span = last_write - first_write
+    write_span = last_write - first_write
 
-    # The synchronized window is the denominator: every producer wrote within
-    # [start_epoch, start_epoch + duration]. measured_span is a cross-check.
-    writes_per_sec = written / duration_s if duration_s > 0 else 0.0
+    # Divide by the actual write span (first write -> last write), not the
+    # nominal window: in paced mode the loop stops on count, so writers that
+    # can't hold the target spill past the window and dividing by the window
+    # would overstate the sustained rate. In flat-out the span ~= window.
+    writes_per_sec = written / write_span if write_span > 0 else 0.0
     late_start = first_write - start_epoch  # >0 means launch overran start-grace
 
     all_latencies: list[float] = []
@@ -567,12 +569,15 @@ def run_multiprocess(
         f"LISTEN/NOTIFY:     {'on' if use_listen_notify else 'off (no write trigger)'}"
     )
     print(f"Window:            {duration_s:.2f}s")
-    print(f"Measured span:     {measured_span:.2f}s   (should be ~= window)")
+    span_note = (
+        "   <- >window: writers behind target" if write_span > duration_s * 1.05 else ""
+    )
+    print(f"Write span:        {write_span:.2f}s{span_note}")
     print(f"Late start:        {late_start:.2f}s   (>~0.5s: raise --start-grace)")
     print(f"Writes:            {written}")
     print(f"Write failures:    {failures}")
     print(f"streams rows:      {row_count}   (== writes: {row_count == written})")
-    print(f"Writes/sec:        {writes_per_sec:.0f}   (aggregate, from steps)")
+    print(f"Writes/sec:        {writes_per_sec:.0f}   (aggregate, over write span)")
     if all_latencies:
         print(
             f"Write latency:     samples={len(all_latencies)}   "

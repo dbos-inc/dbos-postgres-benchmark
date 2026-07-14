@@ -189,7 +189,6 @@ def worker_entry(
     pool_size: int,
     executor_threads: int,
     sample_rate: float,
-    max_samples: int,
     use_listen_notify: bool,
     embed_timestamp: bool,
     result_queue: mp.Queue,
@@ -225,7 +224,7 @@ def worker_entry(
 
         async def one_write() -> None:
             nonlocal count, failures, first_write, last_write
-            sampled = len(latencies) < max_samples and random.random() < sample_rate
+            sampled = random.random() < sample_rate
             t0 = time.monotonic() if sampled else 0.0
             try:
                 await DBOS.write_stream_async(key, make_value())
@@ -337,7 +336,6 @@ def reader_entry(
     pool_size: int,
     executor_threads: int,
     sample_rate: float,
-    max_samples: int,
     use_listen_notify: bool,
     read_result_queue: mp.Queue,
 ) -> None:
@@ -395,7 +393,7 @@ def reader_entry(
                 if first_read == 0.0:
                     first_read = recv
                 last_read = recv
-                if len(latencies) < max_samples and random.random() < sample_rate:
+                if random.random() < sample_rate:
                     try:
                         latencies.append(recv - float(value.split("|", 1)[0]))
                     except ValueError, IndexError:
@@ -448,7 +446,6 @@ def run_multiprocess(
     pool_size: int,
     executor_threads: int,
     sample_rate: float,
-    max_samples: int,
     start_grace: float,
     use_listen_notify: bool,
     reader_processes: int,
@@ -530,7 +527,6 @@ def run_multiprocess(
                 pool_size,
                 executor_threads,
                 sample_rate,
-                max_samples,
                 use_listen_notify,
                 embed_timestamp,
                 result_queue,
@@ -555,7 +551,6 @@ def run_multiprocess(
                 reader_pool_size,
                 reader_executor_threads,
                 sample_rate,
-                max_samples,
                 use_listen_notify,
                 read_result_queue,
             ),
@@ -737,13 +732,11 @@ def main() -> None:
         "--sample-rate",
         type=float,
         default=0.01,
-        help="Fraction of writes sampled for latency (default 0.01)",
-    )
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=1000,
-        help="Max latency samples retained per producer (default 1000)",
+        help="Fraction of writes/reads sampled for latency (default 0.01). Every "
+        "sampled value is kept, so percentiles cover the whole run uniformly; "
+        "this is the only control on sample volume. Each producer/consumer "
+        "returns its samples through the workflow result, so keep it low on long "
+        "high-throughput runs",
     )
     parser.add_argument(
         "--start-grace",
@@ -828,7 +821,6 @@ def main() -> None:
         pool_size,
         executor_threads,
         args.sample_rate,
-        args.max_samples,
         args.start_grace,
         args.listen_notify,
         args.reader_processes,

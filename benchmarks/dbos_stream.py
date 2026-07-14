@@ -312,7 +312,11 @@ def worker_entry(
         return {
             "count": count,
             "failures": failures,
+            # min for the span envelope; max so the parent can see the *latest*
+            # producer to get going (the straggler check) -- collapsing to min
+            # alone would hide a worker that spawned late.
             "first_write": min(firsts) if firsts else 0.0,
+            "last_first_write": max(firsts) if firsts else 0.0,
             "last_write": max(lasts) if lasts else 0.0,
             "latencies": latencies,
         }
@@ -568,6 +572,7 @@ def run_multiprocess(
     written = sum(r["count"] for r in results)
     failures = sum(r["failures"] for r in results)
     firsts = [r["first_write"] for r in results if r["first_write"] > 0]
+    last_firsts = [r["last_first_write"] for r in results if r["last_first_write"] > 0]
     lasts = [r["last_write"] for r in results if r["last_write"] > 0]
     first_write = min(firsts) if firsts else start_epoch
     last_write = max(lasts) if lasts else start_epoch
@@ -578,7 +583,12 @@ def run_multiprocess(
     # can't hold the target spill past the window and dividing by the window
     # would overstate the sustained rate. In flat-out the span ~= window.
     writes_per_sec = written / write_span if write_span > 0 else 0.0
-    late_start = first_write - start_epoch  # >0 means launch overran start-grace
+    # Lateness is about the SLOWEST producer to get going, so use the latest
+    # first-write across all of them. Using the earliest (min) would report 0.00s
+    # whenever any single producer started on time -- blind to a late worker,
+    # which is exactly the failure this is meant to catch.
+    last_first_write = max(last_firsts) if last_firsts else start_epoch
+    late_start = last_first_write - start_epoch
 
     all_latencies: list[float] = []
     for r in results:

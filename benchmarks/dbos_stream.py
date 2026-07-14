@@ -72,6 +72,21 @@ def pin_db_hosts_to_ip() -> None:
         print(f"Pinned {host} -> {ip} for {var}", flush=True)
 
 
+def next_minute_start(min_lead_s: float) -> float:
+    """The next wall-clock minute boundary at least min_lead_s away.
+
+    Split writer/reader hosts each compute this independently and land on the
+    same instant without exchanging timestamps -- just launch both within the
+    same window. Boundaries closer than min_lead_s are skipped so there is time
+    for processes to spawn and DBOS to launch before the window opens.
+    """
+    now = time.time()
+    boundary = (now // 60.0 + 1.0) * 60.0
+    while boundary - now < min_lead_s:
+        boundary += 60.0
+    return boundary
+
+
 def stream_identity(worker_id: int, stream_index: int) -> tuple[str, str]:
     """(workflow_id, stream key) for a producer stream.
 
@@ -136,10 +151,37 @@ async def count_stream_rows() -> int:
         await conn.close()
 
 
+async def wait_for_schema(timeout_s: float = 180.0) -> None:
+    """Reader role: block until the writer host has created the DB and schema.
+
+    The reader host must never recreate the database (that would drop the
+    writers' data), so it waits for dbos.streams to appear instead. This makes
+    host launch order forgiving: start either side first.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            conn = await asyncpg.connect(os.environ["BENCHMARK_DATABASE_URL"])
+            try:
+                if await conn.fetchval(
+                    "SELECT to_regclass('dbos.streams') IS NOT NULL"
+                ):
+                    return
+            finally:
+                await conn.close()
+        except Exception:
+            pass  # DB may not exist yet, or is mid-recreate on the writer host
+        await asyncio.sleep(0.5)
+    raise RuntimeError(
+        "timed out waiting for dbos.streams — start the --role writer host "
+        "(it creates the database and schema)"
+    )
+
+
 def worker_entry(
     worker_id: int,
     streams_per_worker: int,
-    start_epoch_value,
+    start_epoch: float,
     duration_s: float,
     per_producer_rps: float,
     jitter: float,
@@ -150,8 +192,6 @@ def worker_entry(
     max_samples: int,
     use_listen_notify: bool,
     embed_timestamp: bool,
-    ready_barrier,
-    launched_barrier,
     result_queue: mp.Queue,
 ) -> None:
     # All DBOS code lives inside the worker process.
@@ -248,16 +288,8 @@ def worker_entry(
     DBOS.launch()
 
     async def run() -> dict:
-        # Wait until every worker's DBOS is launched before choosing the start
-        # time, so the synchronized window doesn't include process startup.
-        await asyncio.to_thread(ready_barrier.wait)
-
-        # Worker 0 picks the shared start time (now + grace) so producers on all
-        # workers begin writing at the same wall-clock instant.
-        start_epoch = start_epoch_value.value
-        await asyncio.to_thread(launched_barrier.wait)
-        start_epoch = start_epoch_value.value
-
+        # start_epoch is an absolute wall-clock instant chosen by the parent, so
+        # every producer -- on this host or another -- opens the same window.
         # Launch one producer workflow per stream with a deterministic id so
         # reader processes can find it. start_workflow_async returns quickly (a
         # row insert); each producer then sleeps until start_epoch.
@@ -299,7 +331,7 @@ def reader_entry(
     processes: int,
     streams_per_worker: int,
     fanout: int,
-    start_epoch_value,
+    start_epoch: float,
     duration_s: float,
     drain_timeout: float,
     pool_size: int,
@@ -307,8 +339,6 @@ def reader_entry(
     sample_rate: float,
     max_samples: int,
     use_listen_notify: bool,
-    ready_barrier,
-    launched_barrier,
     read_result_queue: mp.Queue,
 ) -> None:
     # All DBOS code lives inside the reader process.
@@ -383,9 +413,6 @@ def reader_entry(
         }
 
     async def run() -> dict:
-        await asyncio.to_thread(ready_barrier.wait)
-        await asyncio.to_thread(launched_barrier.wait)
-        start_epoch = start_epoch_value.value
         hard_deadline = start_epoch + duration_s + drain_timeout
 
         results = await asyncio.gather(
@@ -411,18 +438,6 @@ def reader_entry(
         DBOS.destroy()
 
 
-def set_start_epoch_entry(start_epoch_value, ready_barrier, launched_barrier, grace):
-    """Tiny coordinator process: after all workers launch DBOS, set the shared
-    start time, then release them to launch producers.
-
-    Kept as a separate participant so the value is set exactly once, between the
-    two barriers, regardless of which worker gets there first.
-    """
-    ready_barrier.wait()
-    start_epoch_value.value = time.time() + grace
-    launched_barrier.wait()
-
-
 def run_multiprocess(
     processes: int,
     streams_per_worker: int,
@@ -441,53 +456,73 @@ def run_multiprocess(
     reader_pool_size: int,
     reader_executor_threads: int,
     read_drain_timeout: float,
+    role: str,
 ) -> None:
     # Pin DB hostnames to IPs before any connection is opened, so the many
     # worker processes don't storm the local DNS resolver (see the function).
     pin_db_hosts_to_ip()
 
-    asyncio.run(recreate_database())
+    # Pick the window up front, before any setup, so split writer/reader hosts
+    # compute it at ~the same moment and agree. Split roles snap to a wall-clock
+    # minute boundary (no timestamps to pass around); a single host just waits
+    # out the grace. Either way the grace must cover process spawn + DBOS launch.
+    if role == "all":
+        start_epoch = time.time() + start_grace
+    else:
+        start_epoch = next_minute_start(start_grace)
+    lead = start_epoch - time.time()
+    print(
+        f"Sync start:        {time.strftime('%H:%M:%S', time.localtime(start_epoch))}"
+        f"   (in {lead:.1f}s)"
+        + ("   <- both hosts must print this time" if role != "all" else ""),
+        flush=True,
+    )
 
     ctx = mp.get_context("spawn")
 
-    # Pre-create the DBOS schema in a single child so workers don't serialize
-    # on the migration advisory lock. This also fixes whether the streams
-    # pg_notify trigger exists, so workers must match use_listen_notify.
-    bootstrap = ctx.Process(target=bootstrap_schema_entry, args=(use_listen_notify,))
-    bootstrap.start()
-    bootstrap.join()
+    # The writer host owns the data: it recreates the database and pre-creates
+    # the schema. A reader host must never do this (it would drop the writers'
+    # data mid-run), so it waits for the schema to appear instead.
+    if role == "reader":
+        asyncio.run(wait_for_schema())
+    else:
+        asyncio.run(recreate_database())
+        # Pre-create the DBOS schema in a single child so workers don't serialize
+        # on the migration advisory lock. This also fixes whether the streams
+        # pg_notify trigger exists, so workers must match use_listen_notify.
+        bootstrap = ctx.Process(
+            target=bootstrap_schema_entry, args=(use_listen_notify,)
+        )
+        bootstrap.start()
+        bootstrap.join()
 
     total_streams = processes * streams_per_worker
     per_producer_rps = (total_rps / total_streams) if total_rps > 0 else 0.0
     readers_on = reader_processes > 0 and fanout > 0
     # Producers embed a write timestamp in each value only when readers will
     # consume it (to measure end-to-end latency) — it costs work on the hot path.
+    # This keys off the args, not the role, so a writer-only host still embeds
+    # timestamps when readers are running on another host.
     embed_timestamp = readers_on
+
+    # role decides what runs *here*; the topology args must match on both hosts
+    # so the reader host computes the same stream identities as the writers.
+    run_producers = role in ("all", "writer")
+    run_readers = readers_on and role in ("all", "reader")
 
     result_queue: mp.Queue = ctx.Queue()
     read_result_queue: mp.Queue = ctx.Queue()
-    start_epoch_value = ctx.Value("d", 0.0)
-    # Participants at the barriers: producers + readers + 1 coordinator that sets
-    # start_epoch between the two barriers.
-    n_readers = reader_processes if readers_on else 0
-    parties = processes + n_readers + 1
-    ready_barrier = ctx.Barrier(parties)
-    launched_barrier = ctx.Barrier(parties)
-
-    coordinator = ctx.Process(
-        target=set_start_epoch_entry,
-        args=(start_epoch_value, ready_barrier, launched_barrier, start_grace),
-    )
-    coordinator.start()
+    n_producers = processes if run_producers else 0
+    n_readers = reader_processes if run_readers else 0
 
     workers = []
-    for worker_id in range(processes):
+    for worker_id in range(n_producers):
         p = ctx.Process(
             target=worker_entry,
             args=(
                 worker_id,
                 streams_per_worker,
-                start_epoch_value,
+                start_epoch,
                 duration_s,
                 per_producer_rps,
                 jitter,
@@ -498,8 +533,6 @@ def run_multiprocess(
                 max_samples,
                 use_listen_notify,
                 embed_timestamp,
-                ready_barrier,
-                launched_barrier,
                 result_queue,
             ),
         )
@@ -516,7 +549,7 @@ def run_multiprocess(
                 processes,
                 streams_per_worker,
                 fanout,
-                start_epoch_value,
+                start_epoch,
                 duration_s,
                 read_drain_timeout,
                 reader_pool_size,
@@ -524,8 +557,6 @@ def run_multiprocess(
                 sample_rate,
                 max_samples,
                 use_listen_notify,
-                ready_barrier,
-                launched_barrier,
                 read_result_queue,
             ),
         )
@@ -538,9 +569,7 @@ def run_multiprocess(
         p.join()
     for p in readers:
         p.join()
-    coordinator.join()
 
-    start_epoch = start_epoch_value.value
     written = sum(r["count"] for r in results)
     failures = sum(r["failures"] for r in results)
     firsts = [r["first_write"] for r in results if r["first_write"] > 0]
@@ -562,6 +591,9 @@ def run_multiprocess(
 
     row_count = asyncio.run(count_stream_rows())
 
+    print(
+        f"Role:              {role}   (producers here: {run_producers}, readers here: {run_readers})"
+    )
     print(f"Processes:         {processes}")
     print(f"Streams/worker:    {streams_per_worker}")
     print(f"Total streams:     {total_streams}")
@@ -571,22 +603,30 @@ def run_multiprocess(
         print(f"Target RPS:        {total_rps}  ({per_producer_rps:.1f}/stream)")
         print(f"Jitter:            {jitter:.2f}   (fraction of interval, 0 = lockstep)")
     print(
-        f"Pool size/proc:    {pool_size}   (total DB conns ~= {processes * pool_size})"
-    )
-    print(f"Exec threads/proc: {executor_threads}")
-    print(
         f"LISTEN/NOTIFY:     {'on' if use_listen_notify else 'off (no write trigger)'}"
     )
     print(f"Window:            {duration_s:.2f}s")
-    span_note = (
-        "   <- >window: writers behind target" if write_span > duration_s * 1.05 else ""
-    )
-    print(f"Write span:        {write_span:.2f}s{span_note}")
-    print(f"Late start:        {late_start:.2f}s   (>~0.5s: raise --start-grace)")
-    print(f"Writes:            {written}")
-    print(f"Write failures:    {failures}")
-    print(f"streams rows:      {row_count}   (== writes: {row_count == written})")
-    print(f"Writes/sec:        {writes_per_sec:.0f}   (aggregate, over write span)")
+
+    if run_producers:
+        print(
+            f"Pool size/proc:    {pool_size}   (producer DB conns ~= {processes * pool_size})"
+        )
+        print(f"Exec threads/proc: {executor_threads}")
+        span_note = (
+            "   <- >window: writers behind target"
+            if write_span > duration_s * 1.05
+            else ""
+        )
+        print(f"Write span:        {write_span:.2f}s{span_note}")
+        print(f"Late start:        {late_start:.2f}s   (>~0.5s: raise --start-grace)")
+        print(f"Writes:            {written}")
+        print(f"Write failures:    {failures}")
+        print(f"streams rows:      {row_count}   (== writes: {row_count == written})")
+        print(f"Writes/sec:        {writes_per_sec:.0f}   (aggregate, over write span)")
+    else:
+        # Reader-only host: writers ran elsewhere, so the streams table is the
+        # only view of what was written.
+        print(f"streams rows:      {row_count}   (written by the --role writer host)")
     if all_latencies:
         print(
             f"Write latency:     samples={len(all_latencies)}   "
@@ -596,24 +636,26 @@ def run_multiprocess(
             f"max={max(all_latencies)*1000:.2f}ms"
         )
 
-    if readers_on:
+    if run_readers:
         read = sum(r["count"] for r in read_results)
         read_failures = sum(r["failed"] for r in read_results)
         r_firsts = [r["first_read"] for r in read_results if r["first_read"] > 0]
         r_lasts = [r["last_read"] for r in read_results if r["last_read"] > 0]
         read_span = (max(r_lasts) - min(r_firsts)) if r_firsts and r_lasts else 0.0
         reads_per_sec = read / read_span if read_span > 0 else 0.0
-        expected = written * fanout  # each written value read once per fanout reader
+        # Use the streams table as the write count so a reader-only host (whose
+        # writers live on another host) can still compute coverage.
+        expected = row_count * fanout  # each written value read once per fanout reader
         coverage = read / expected if expected > 0 else 0.0
         e2e: list[float] = []
         for r in read_results:
             e2e.extend(r["latencies"])
-        total_conns = processes * pool_size + reader_processes * reader_pool_size
+        reader_conns = reader_processes * reader_pool_size
 
         print(f"Reader procs:      {reader_processes}")
         print(f"Fanout:            {fanout}   (readers/stream)")
         print(
-            f"Reader pool/proc:  {reader_pool_size}   (total DB conns ~= {total_conns})"
+            f"Reader pool/proc:  {reader_pool_size}   (reader DB conns ~= {reader_conns})"
         )
         print(f"Reads:             {read}")
         print(f"Read failures:     {read_failures}")
@@ -634,6 +676,16 @@ def run_multiprocess(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--role",
+        choices=("all", "writer", "reader"),
+        default="all",
+        help="What to run on this host: 'all' (default, writers+readers here), "
+        "'writer' (producers only; recreates the DB and schema), or 'reader' "
+        "(readers only; waits for the writer host's schema). Split roles start "
+        "at the next wall-clock minute boundary, so two hosts sync with no "
+        "timestamps -- just launch both in the same window with identical args",
+    )
     parser.add_argument(
         "--processes", type=int, default=16, help="Number of worker processes"
     )
@@ -696,8 +748,11 @@ def main() -> None:
     parser.add_argument(
         "--start-grace",
         type=float,
-        default=5.0,
-        help="Seconds between launch and synchronized write start (default 5)",
+        default=20.0,
+        help="Lead time before the window opens; must cover process spawn + "
+        "DBOS launch (default 20). For --role all this is the wait outright; "
+        "for writer/reader it is the minimum lead, and minute boundaries closer "
+        "than this are skipped. Check 'Late start' in the output if too small",
     )
     parser.add_argument(
         "--listen-notify",
@@ -732,6 +787,9 @@ def main() -> None:
         help="Extra seconds past the window for readers to drain backlog (default 60)",
     )
     args = parser.parse_args()
+
+    if args.role == "reader" and not (args.reader_processes > 0 and args.fanout > 0):
+        parser.error("--role reader needs --reader-processes > 0 and --fanout > 0")
 
     readers_on = args.reader_processes > 0 and args.fanout > 0
     total_consumers = args.processes * args.streams_per_worker * args.fanout
@@ -778,6 +836,7 @@ def main() -> None:
         reader_pool_size,
         reader_executor_threads,
         args.read_drain_timeout,
+        args.role,
     )
 
 

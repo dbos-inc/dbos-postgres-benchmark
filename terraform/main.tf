@@ -80,7 +80,7 @@ resource "aws_security_group" "rds" {
 resource "aws_db_instance" "postgres" {
   identifier     = "dbos-bench-postgres"
   engine         = "postgres"
-  engine_version = "16"
+  engine_version = "18"
 
   instance_class          = "db.m7i.24xlarge"
   allocated_storage       = 300

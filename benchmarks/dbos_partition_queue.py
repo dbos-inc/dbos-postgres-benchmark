@@ -1,7 +1,23 @@
-"""Benchmark DBOS queue.enqueue_async + completion throughput at a target rate.
+"""Benchmark DBOS partitioned queue enqueue + completion throughput at a target rate.
 
-Two-phase: enqueue all workflows at the target rate, then drain all completions.
-Reports both enqueue and end-to-end completion throughput.
+Same two-phase shape as dbos_queue.py: enqueue all workflows at the target rate,
+then drain all completions. Reports both enqueue and end-to-end completion
+throughput.
+
+The difference is that every queue is created with ``partition_queue=True``, so
+concurrency limits apply *per partition* rather than to the queue as a whole.
+Each enqueue picks a partition key uniformly at random from ``--partitions``
+keys.
+
+Throughput notes:
+  * With ``--concurrency 1`` (the default) DBOS takes the batched dequeue path:
+    one transaction per poll claims the head-of-line workflow of every
+    partition. The rough ceiling is therefore
+    ``queues * partitions * concurrency / polling_interval`` workflows/sec, so
+    a run needs enough partitions to absorb ``--rps`` or the drain phase will
+    dominate. The printed "Dequeue ceiling" line reports this estimate.
+  * With ``--concurrency > 1`` DBOS falls back to sweeping one partition per
+    round trip, which is much slower for large partition counts.
 """
 
 import argparse
@@ -9,7 +25,6 @@ import asyncio
 import multiprocessing as mp
 import os
 import random
-import sys
 import time
 import uuid
 from urllib.parse import urlparse
@@ -47,7 +62,7 @@ def bootstrap_schema_entry() -> None:
     from dbos import DBOS, DBOSConfig
 
     config: DBOSConfig = {
-        "name": "dbos-queue-bench-bootstrap",
+        "name": "dbos-partition-queue-bench-bootstrap",
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": 3,
@@ -66,6 +81,10 @@ def worker_entry(
     pool_size: int,
     executor_threads: int,
     num_queues: int,
+    num_partitions: int,
+    concurrency: int,
+    polling_interval: float,
+    drain_timeout: float,
     sample_rate: float,
     ready_barrier,
     enqueue_done_barrier,
@@ -73,17 +92,30 @@ def worker_entry(
     result_queue: mp.Queue,
 ) -> None:
     # All DBOS code lives inside the worker process.
-    from dbos import DBOS, DBOSConfig, Queue
+    from dbos import DBOS, DBOSConfig, Queue, SetEnqueueOptions
 
     @DBOS.workflow()
     async def noop_workflow() -> int:
         return 1
 
     # Create all queues in every worker so any worker can enqueue to any queue.
-    # Workflows are enqueued to a random queue per call.
+    # Workflows are enqueued to a random queue per call. On a partitioned queue
+    # `concurrency` is the global (cluster-wide) limit *per partition*, so
+    # worker_concurrency is left unset: it may not exceed concurrency, and
+    # setting it would also disable the batched dequeue path.
     queues = [
-        Queue(f"bench-queue-{i}", worker_concurrency=1000) for i in range(num_queues)
+        Queue(
+            f"bench-partition-queue-{i}",
+            concurrency=concurrency,
+            partition_queue=True,
+            polling_interval_sec=polling_interval,
+        )
+        for i in range(num_queues)
     ]
+
+    # Partition keys are scoped per queue, so the same key list serves every
+    # queue. Pre-build it once to keep the enqueue path free of formatting.
+    partition_keys = [f"p{i:08d}" for i in range(num_partitions)]
 
     # Partition listening across workers. num_queues must divide num_workers,
     # so each queue is listened to by exactly num_workers // num_queues workers.
@@ -93,7 +125,7 @@ def worker_entry(
     listen = [queues[worker_id % num_queues]]
 
     config: DBOSConfig = {
-        "name": "dbos-queue-bench",
+        "name": "dbos-partition-queue-bench",
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": pool_size,
@@ -113,7 +145,11 @@ def worker_entry(
     async def enqueue_one() -> None:
         sampled = random.random() < sample_rate
         start = time.time() if sampled else 0.0
-        handle = await random.choice(queues).enqueue_async(noop_workflow)
+        # asyncio.gather wraps each coroutine in a Task, and each Task copies
+        # the current contextvars, so the enqueue options set here are local to
+        # this enqueue even though the batch runs concurrently.
+        with SetEnqueueOptions(queue_partition_key=random.choice(partition_keys)):
+            handle = await random.choice(queues).enqueue_async(noop_workflow)
         if sampled:
             samples.append((handle.workflow_id, start))
 
@@ -162,18 +198,50 @@ def worker_entry(
         # on the system DB.
         drain_start_wall = time.time()
         drain_end_wall = drain_start_wall
+        drain_timed_out = False
+        unfinished_remaining = 0
         if worker_id == 0:
+            polls = 0
             while True:
                 unfinished = await DBOS.list_workflows_async(
                     status=["PENDING", "ENQUEUED"], limit=1
                 )
                 if not unfinished:
                     break
+                # Per-partition concurrency caps the drain rate, so a run can
+                # spend far longer draining than enqueueing. Log progress, and
+                # bail out if the (optional) timeout is exceeded.
+                if drain_timeout > 0 and time.time() - drain_start_wall > drain_timeout:
+                    drain_timed_out = True
+                    break
+                polls += 1
+                if polls % 100 == 0:
+                    DBOS.logger.info(
+                        f"[pid {os.getpid()}] still draining after "
+                        f"{time.time() - drain_start_wall:.0f}s",
+                    )
                 await asyncio.sleep(0.1)
             drain_end_wall = time.time()
-            DBOS.logger.info(
-                f"[pid {os.getpid()}] drain done in {drain_end_wall - drain_start_wall:.2f}s",
-            )
+            if drain_timed_out:
+                # Report how much actually finished so throughput isn't
+                # credited for workflows that never ran.
+                conn = await asyncpg.connect(os.environ["BENCHMARK_DATABASE_URL"])
+                try:
+                    unfinished_remaining = await conn.fetchval(
+                        "SELECT count(*) FROM dbos.workflow_status "
+                        "WHERE status IN ('PENDING', 'ENQUEUED')"
+                    )
+                finally:
+                    await conn.close()
+                DBOS.logger.warning(
+                    f"[pid {os.getpid()}] drain timed out after "
+                    f"{drain_end_wall - drain_start_wall:.2f}s with "
+                    f"{unfinished_remaining} workflows unfinished",
+                )
+            else:
+                DBOS.logger.info(
+                    f"[pid {os.getpid()}] drain done in {drain_end_wall - drain_start_wall:.2f}s",
+                )
 
         # Sync so all workers wait until drain finishes before looking up samples.
         await asyncio.to_thread(done_barrier.wait)
@@ -207,6 +275,8 @@ def worker_entry(
             "enqueue_end_wall": enqueue_end_wall,
             "drain_start_wall": drain_start_wall,
             "drain_end_wall": drain_end_wall,
+            "drain_timed_out": drain_timed_out,
+            "unfinished_remaining": unfinished_remaining,
             "latencies": latencies,
         }
 
@@ -225,6 +295,10 @@ def run_multiprocess(
     executor_threads: int,
     processes: int,
     num_queues: int,
+    num_partitions: int,
+    concurrency: int,
+    polling_interval: float,
+    drain_timeout: float,
     sample_rate: float,
 ) -> None:
     asyncio.run(recreate_database())
@@ -256,6 +330,10 @@ def run_multiprocess(
                 pool_size,
                 executor_threads,
                 num_queues,
+                num_partitions,
+                concurrency,
+                polling_interval,
+                drain_timeout,
                 sample_rate,
                 ready_barrier,
                 enqueue_done_barrier,
@@ -278,14 +356,23 @@ def run_multiprocess(
     enqueue_time = last_enqueue_end - first_start
     drain_time = last_drain_end - last_enqueue_end
     total_time = last_drain_end - first_start
+    drain_timed_out = any(r["drain_timed_out"] for r in results)
+    unfinished = sum(r["unfinished_remaining"] for r in results)
+    completed = enqueued - unfinished
     enqueue_rps = enqueued / enqueue_time if enqueue_time > 0 else 0
-    completion_rps = enqueued / total_time if total_time > 0 else 0
+    completion_rps = completed / total_time if total_time > 0 else 0
+    # Batched partitioned dequeue claims each partition's head once per poll.
+    ceiling = num_queues * num_partitions * concurrency / polling_interval
     all_latencies: list[float] = []
     for r in results:
         all_latencies.extend(r["latencies"])
 
     print(f"Processes:        {processes}")
-    print(f"Queues:           {num_queues}")
+    print(f"Queues:           {num_queues}  (partitioned)")
+    print(f"Partitions/queue: {num_partitions}")
+    print(f"Concurrency:      {concurrency}  (global, per partition)")
+    print(f"Polling interval: {polling_interval}s")
+    print(f"Dequeue ceiling:  ~{ceiling:.0f} workflows/sec")
     print(f"Target RPS:       {total_rps}  ({per_proc_rps}/proc)")
     print(f"Enqueue batch:    {enqueue_batch_size}")
     print(f"Pool size/proc:   {pool_size}")
@@ -297,6 +384,11 @@ def run_multiprocess(
     print(f"Enqueue failures: {enqueue_failures}")
     print(f"Enqueue RPS:      {enqueue_rps:.0f}")
     print(f"Completion RPS:   {completion_rps:.0f}   (end-to-end)")
+    if drain_timed_out:
+        print(
+            f"WARNING: drain timed out with {unfinished} workflows unfinished; "
+            f"completion RPS covers only the {completed} that finished."
+        )
     if all_latencies:
         print(
             f"Latency samples:  {len(all_latencies)}   "
@@ -343,6 +435,30 @@ def main() -> None:
         help="Number of queue shards (workers are assigned round-robin)",
     )
     parser.add_argument(
+        "--partitions",
+        type=int,
+        default=1000,
+        help="Partitions per queue; each workflow picks one uniformly at random",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Global concurrency limit per partition (default 1)",
+    )
+    parser.add_argument(
+        "--polling-interval",
+        type=float,
+        default=1.0,
+        help="Queue polling interval in seconds (dequeue sweep cadence)",
+    )
+    parser.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=0.0,
+        help="Give up on the drain phase after this many seconds (0 = never)",
+    )
+    parser.add_argument(
         "--sample-rate",
         type=float,
         default=0.01,
@@ -357,6 +473,10 @@ def main() -> None:
         args.executor_threads,
         args.processes,
         args.queues,
+        args.partitions,
+        args.concurrency,
+        args.polling_interval,
+        args.drain_timeout,
         args.sample_rate,
     )
 

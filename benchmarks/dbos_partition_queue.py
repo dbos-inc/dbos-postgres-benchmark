@@ -4,17 +4,18 @@ Same two-phase shape as dbos_queue.py: enqueue all workflows at the target rate,
 then drain all completions. Reports both enqueue and end-to-end completion
 throughput.
 
-The difference is that every queue is created with ``partition_queue=True``, so
-concurrency limits apply *per partition* rather than to the queue as a whole.
-Each enqueue picks a partition key uniformly at random from ``--partitions``
-keys.
+The difference is a single database-backed queue, registered once via
+``DBOS.register_queue`` with ``partition_queue=True``, so concurrency limits
+apply *per partition* rather than to the queue as a whole. Every worker listens
+to it. Each enqueue picks a partition key uniformly at random from
+``--partitions`` keys.
 
 Throughput notes:
   * With ``--concurrency 1`` (the default) DBOS takes the batched dequeue path:
     one transaction per poll claims the head-of-line workflow of every
     partition. The rough ceiling is therefore
-    ``queues * partitions * concurrency / polling_interval`` workflows/sec, so
-    a run needs enough partitions to absorb ``--rps`` or the drain phase will
+    ``partitions * concurrency / polling_interval`` workflows/sec, so a run
+    needs enough partitions to absorb ``--rps`` or the drain phase will
     dominate. The printed "Dequeue ceiling" line reports this estimate.
   * With ``--concurrency > 1`` DBOS falls back to sweeping one partition per
     round trip, which is much slower for large partition counts.
@@ -30,6 +31,13 @@ import uuid
 from urllib.parse import urlparse
 
 import asyncpg
+
+# The queue is database-backed, so the bootstrap process registers it and every
+# worker picks it up from the system database. Workers must share the bootstrap
+# app name: queues are owned by the application that registered them, and a
+# worker only dequeues from queues its own application owns.
+APP_NAME = "dbos-partition-bench"
+QUEUE_NAME = "bench-partition-queue"
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -52,38 +60,45 @@ async def recreate_database() -> None:
         await conn.close()
 
 
-def bootstrap_schema_entry() -> None:
-    """Pre-create the DBOS system schema in a one-shot subprocess.
+def bootstrap_entry(concurrency: int, polling_interval: float) -> None:
+    """Pre-create the DBOS system schema and register the queue, one-shot.
 
     Runs in its own spawned process so the parent never imports DBOS.
     Pre-running migrations eliminates the per-worker advisory-lock serialization
-    when many workers launch in parallel.
+    when many workers launch in parallel, and registering the queue here keeps
+    the workers from all racing to upsert the same row at startup.
     """
     from dbos import DBOS, DBOSConfig
 
     config: DBOSConfig = {
-        "name": "dbos-partition-bootstrap",
+        "name": APP_NAME,
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": 3,
     }
     DBOS(config=config)
     DBOS.launch()
+    # On a partitioned queue `concurrency` is the global (cluster-wide) limit
+    # *per partition*. worker_concurrency is left unset: it may not exceed
+    # concurrency, and setting it would also disable the batched dequeue path.
+    DBOS.register_queue(
+        QUEUE_NAME,
+        concurrency=concurrency,
+        partition_queue=True,
+        polling_interval_sec=polling_interval,
+        on_conflict="always_update",
+    )
     DBOS.destroy()
 
 
 def worker_entry(
     worker_id: int,
-    num_workers: int,
     target_rps: int,
     duration_s: float,
     enqueue_batch_size: int,
     pool_size: int,
     executor_threads: int,
-    num_queues: int,
     num_partitions: int,
-    concurrency: int,
-    polling_interval: float,
     drain_timeout: float,
     sample_rate: float,
     ready_barrier,
@@ -92,40 +107,17 @@ def worker_entry(
     result_queue: mp.Queue,
 ) -> None:
     # All DBOS code lives inside the worker process.
-    from dbos import DBOS, DBOSConfig, Queue, SetEnqueueOptions
+    from dbos import DBOS, DBOSConfig, SetEnqueueOptions
 
     @DBOS.workflow()
     async def noop_workflow() -> int:
         return 1
 
-    # Create all queues in every worker so any worker can enqueue to any queue.
-    # Workflows are enqueued to a random queue per call. On a partitioned queue
-    # `concurrency` is the global (cluster-wide) limit *per partition*, so
-    # worker_concurrency is left unset: it may not exceed concurrency, and
-    # setting it would also disable the batched dequeue path.
-    queues = [
-        Queue(
-            f"bench-partition-queue-{i}",
-            concurrency=concurrency,
-            partition_queue=True,
-            polling_interval_sec=polling_interval,
-        )
-        for i in range(num_queues)
-    ]
-
-    # Partition keys are scoped per queue, so the same key list serves every
-    # queue. Pre-build it once to keep the enqueue path free of formatting.
+    # Pre-build the partition keys to keep the enqueue path free of formatting.
     partition_keys = [f"p{i:08d}" for i in range(num_partitions)]
 
-    # Partition listening across workers. num_queues must divide num_workers,
-    # so each queue is listened to by exactly num_workers // num_queues workers.
-    assert (
-        num_workers % num_queues == 0
-    ), f"num_queues ({num_queues}) must divide num_workers ({num_workers})"
-    listen = [queues[worker_id % num_queues]]
-
     config: DBOSConfig = {
-        "name": "dbos-partition-queue-bench",
+        "name": APP_NAME,
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": pool_size,
@@ -133,8 +125,13 @@ def worker_entry(
         "executor_id": str(uuid.uuid7()),
     }
     DBOS(config=config)
-    DBOS.listen_queues(listen)
+    # No listen_queues: without a filter, every worker polls every queue this
+    # application owns, which is exactly the one the bootstrap registered.
     DBOS.launch()
+
+    # The queue lives in the system database, not the in-memory registry.
+    queue = DBOS.retrieve_queue(QUEUE_NAME)
+    assert queue is not None, f"Queue {QUEUE_NAME} was not registered by bootstrap"
 
     # Wait until all processes are started before beginning the benchmark.
     ready_barrier.wait()
@@ -149,7 +146,7 @@ def worker_entry(
         # the current contextvars, so the enqueue options set here are local to
         # this enqueue even though the batch runs concurrently.
         with SetEnqueueOptions(queue_partition_key=random.choice(partition_keys)):
-            handle = await random.choice(queues).enqueue_async(noop_workflow)
+            handle = await queue.enqueue_async(noop_workflow)
         if sampled:
             samples.append((handle.workflow_id, start))
 
@@ -294,7 +291,6 @@ def run_multiprocess(
     pool_size: int,
     executor_threads: int,
     processes: int,
-    num_queues: int,
     num_partitions: int,
     concurrency: int,
     polling_interval: float,
@@ -307,13 +303,16 @@ def run_multiprocess(
 
     ctx = mp.get_context("spawn")
 
-    # Pre-create the DBOS schema in a single child so workers don't serialize
-    # on the migration advisory lock.
-    bootstrap = ctx.Process(target=bootstrap_schema_entry)
+    # Pre-create the DBOS schema and register the queue in a single child so
+    # workers don't serialize on the migration advisory lock.
+    bootstrap = ctx.Process(
+        target=bootstrap_entry, args=(concurrency, polling_interval)
+    )
     bootstrap.start()
     bootstrap.join()
     # Workers silently fall back to running migrations themselves if bootstrap
-    # dies, which hides the failure behind slow, serialized worker startup.
+    # dies, which hides the failure behind slow, serialized worker startup. A
+    # dead bootstrap also means no queue, so the workers would fail anyway.
     if bootstrap.exitcode != 0:
         raise RuntimeError(f"schema bootstrap failed (exit {bootstrap.exitcode})")
 
@@ -327,16 +326,12 @@ def run_multiprocess(
             target=worker_entry,
             args=(
                 worker_id,
-                processes,
                 per_proc_rps,
                 duration_s,
                 enqueue_batch_size,
                 pool_size,
                 executor_threads,
-                num_queues,
                 num_partitions,
-                concurrency,
-                polling_interval,
                 drain_timeout,
                 sample_rate,
                 ready_barrier,
@@ -366,14 +361,14 @@ def run_multiprocess(
     enqueue_rps = enqueued / enqueue_time if enqueue_time > 0 else 0
     completion_rps = completed / total_time if total_time > 0 else 0
     # Batched partitioned dequeue claims each partition's head once per poll.
-    ceiling = num_queues * num_partitions * concurrency / polling_interval
+    ceiling = num_partitions * concurrency / polling_interval
     all_latencies: list[float] = []
     for r in results:
         all_latencies.extend(r["latencies"])
 
     print(f"Processes:        {processes}")
-    print(f"Queues:           {num_queues}  (partitioned)")
-    print(f"Partitions/queue: {num_partitions}")
+    print(f"Queue:            {QUEUE_NAME}  (partitioned, database-backed)")
+    print(f"Partitions:       {num_partitions}")
     print(f"Concurrency:      {concurrency}  (global, per partition)")
     print(f"Polling interval: {polling_interval}s")
     print(f"Dequeue ceiling:  ~{ceiling:.0f} workflows/sec")
@@ -433,16 +428,10 @@ def main() -> None:
         "--processes", type=int, default=128, help="Number of worker processes"
     )
     parser.add_argument(
-        "--queues",
-        type=int,
-        default=1,
-        help="Number of queue shards (workers are assigned round-robin)",
-    )
-    parser.add_argument(
         "--partitions",
         type=int,
         default=1000,
-        help="Partitions per queue; each workflow picks one uniformly at random",
+        help="Number of partitions; each workflow picks one uniformly at random",
     )
     parser.add_argument(
         "--concurrency",
@@ -476,7 +465,6 @@ def main() -> None:
         args.pool_size,
         args.executor_threads,
         args.processes,
-        args.queues,
         args.partitions,
         args.concurrency,
         args.polling_interval,

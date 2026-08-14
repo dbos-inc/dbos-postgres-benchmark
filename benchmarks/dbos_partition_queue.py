@@ -62,7 +62,7 @@ def bootstrap_schema_entry() -> None:
     from dbos import DBOS, DBOSConfig
 
     config: DBOSConfig = {
-        "name": "dbos-partition-queue-bench-bootstrap",
+        "name": "dbos-partition-bootstrap",
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": 3,
@@ -312,6 +312,10 @@ def run_multiprocess(
     bootstrap = ctx.Process(target=bootstrap_schema_entry)
     bootstrap.start()
     bootstrap.join()
+    # Workers silently fall back to running migrations themselves if bootstrap
+    # dies, which hides the failure behind slow, serialized worker startup.
+    if bootstrap.exitcode != 0:
+        raise RuntimeError(f"schema bootstrap failed (exit {bootstrap.exitcode})")
 
     result_queue: mp.Queue = ctx.Queue()
     ready_barrier = ctx.Barrier(processes)

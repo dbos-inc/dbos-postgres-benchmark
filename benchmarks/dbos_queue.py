@@ -50,7 +50,7 @@ def bootstrap_schema_entry() -> None:
         "name": "dbos-queue-bench-bootstrap",
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
-        "sys_db_pool_size": 2,
+        "sys_db_pool_size": 3,
     }
     DBOS(config=config)
     DBOS.launch()
@@ -325,7 +325,7 @@ def main() -> None:
         help="Concurrent enqueues per batch (Phase 1)",
     )
     parser.add_argument(
-        "--pool-size", type=int, default=2, help="DBOS system DB pool size per process"
+        "--pool-size", type=int, default=3, help="DBOS system DB pool size per process"
     )
     parser.add_argument(
         "--executor-threads",

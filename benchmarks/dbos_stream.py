@@ -134,7 +134,7 @@ def bootstrap_schema_entry(use_listen_notify: bool) -> None:
         "name": "dbos-stream-bench-bootstrap",
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
-        "sys_db_pool_size": 2,
+        "sys_db_pool_size": 3,
         "use_listen_notify": use_listen_notify,
     }
     DBOS(config=config)

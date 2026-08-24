@@ -154,9 +154,10 @@ def worker_entry(
 
 def enqueuer_entry(
     enqueuer_id: int,
-    target_rps: int,
+    num_enqueuers: int,
+    my_enqueues: int,
     duration_s: float,
-    enqueue_batch_size: int,
+    max_inflight: int,
     pool_size: int,
     num_partitions: int,
     drain_timeout: float,
@@ -186,48 +187,66 @@ def enqueuer_entry(
     # samples: list of (workflow_id, start_wallclock_seconds) for latency lookup.
     samples: list[tuple[str, float]] = []
 
-    async def enqueue_one() -> None:
-        sampled = random.random() < sample_rate
-        start = time.time() if sampled else 0.0
-        options: EnqueueOptions = {
-            "queue_name": QUEUE_NAME,
-            "workflow_name": WORKFLOW_NAME,
-            "queue_partition_key": random.choice(partition_keys),
-        }
-        # Client enqueues are synchronous DB writes dispatched to a thread, so
-        # in-flight enqueues per process are capped by the client pool size.
-        handle = await client.enqueue_async(options)
-        if sampled:
-            samples.append((handle.get_workflow_id(), start))
-
-    async def enqueue_batch() -> int:
-        # Fire all enqueues in this batch concurrently.
-        await asyncio.gather(*(enqueue_one() for _ in range(enqueue_batch_size)))
-        return enqueue_batch_size
-
     async def run() -> dict:
         print(f"Starting enqueue for enqueuer {enqueuer_id}", flush=True)
-        batches_per_second = target_rps / enqueue_batch_size
-        interval = 1.0 / batches_per_second
-        total_batches = int(batches_per_second * duration_s)
 
         enqueued = 0
         enqueue_failures = 0
+
+        # Arrivals sit on a uniform grid: one enqueue every `gap` seconds,
+        # rather than a burst of N fired at once every N*gap. Each enqueuer's
+        # grid is additionally offset by a fraction of one gap, because every
+        # enqueuer leaves the ready barrier at the same instant -- without the
+        # offset the whole pool fires in lockstep and the queue sees a burst
+        # train (all arrivals in a fraction of each cycle, silence between)
+        # instead of the steady rate the run is supposed to apply.
+        gap = duration_s / my_enqueues if my_enqueues else 0.0
+        phase = gap * (enqueuer_id / num_enqueuers)
+
+        # Cap in-flight enqueues rather than batching them. Blocking on acquire
+        # means this process cannot sustain its share of the target rate; that
+        # surfaces as a shortfall in the reported Enqueue RPS instead of
+        # silently reshaping the arrival pattern.
+        sem = asyncio.Semaphore(max_inflight)
+        inflight: set[asyncio.Task] = set()
+
+        async def enqueue_one() -> None:
+            # Counted per enqueue: a failure loses exactly one arrival, not the
+            # whole batch it happened to be dispatched with.
+            nonlocal enqueued, enqueue_failures
+            try:
+                sampled = random.random() < sample_rate
+                start = time.time() if sampled else 0.0
+                options: EnqueueOptions = {
+                    "queue_name": QUEUE_NAME,
+                    "workflow_name": WORKFLOW_NAME,
+                    "queue_partition_key": random.choice(partition_keys),
+                }
+                handle = await client.enqueue_async(options)
+                enqueued += 1
+                if sampled:
+                    samples.append((handle.get_workflow_id(), start))
+            except Exception:
+                enqueue_failures += 1
+            finally:
+                sem.release()
 
         # --- Phase 1: enqueue at target rate ---
         # Record wall-clock start/end so the parent can compute elapsed across
         # all enqueuers as (last end - first start).
         enqueue_start_wall = time.time()
         loop_start = time.monotonic()
-        for i in range(total_batches):
-            target_time = loop_start + i * interval
+        for i in range(my_enqueues):
+            target_time = loop_start + phase + i * gap
             now = time.monotonic()
             if target_time > now:
                 await asyncio.sleep(target_time - now)
-            try:
-                enqueued += await enqueue_batch()
-            except Exception:
-                enqueue_failures += 1
+            await sem.acquire()
+            task = asyncio.create_task(enqueue_one())
+            inflight.add(task)
+            task.add_done_callback(inflight.discard)
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
         enqueue_end_wall = time.time()
         print(
             f"[pid {os.getpid()}] enqueue done: "
@@ -342,7 +361,7 @@ def enqueuer_entry(
 def run_multiprocess(
     total_rps: int,
     duration_s: float,
-    enqueue_batch_size: int,
+    max_inflight: int,
     pool_size: int,
     executor_threads: int,
     num_workers: int,
@@ -355,7 +374,13 @@ def run_multiprocess(
 ) -> None:
     asyncio.run(recreate_database())
 
-    per_proc_rps = total_rps // num_enqueuers
+    # Exact total with the remainder spread one-per-enqueuer. The old form
+    # truncated twice (integer rps-per-process, then int() on the batch count),
+    # silently under-delivering by up to a third at low rates.
+    total_enqueues = round(total_rps * duration_s)
+    base, extra = divmod(total_enqueues, num_enqueuers)
+    enqueue_counts = [base + (1 if i < extra else 0) for i in range(num_enqueuers)]
+    per_proc_rps = total_rps / num_enqueuers
 
     ctx = mp.get_context("spawn")
 
@@ -394,9 +419,10 @@ def run_multiprocess(
             target=enqueuer_entry,
             args=(
                 enqueuer_id,
-                per_proc_rps,
+                num_enqueuers,
+                enqueue_counts[enqueuer_id],
                 duration_s,
-                enqueue_batch_size,
+                max_inflight,
                 pool_size,
                 num_partitions,
                 drain_timeout,
@@ -444,8 +470,9 @@ def run_multiprocess(
     print(f"Concurrency:      {concurrency}  (partition_concurrency)")
     print(f"Polling interval: {polling_interval}s")
     print(f"Dequeue ceiling:  ~{ceiling:.0f} workflows/sec")
-    print(f"Target RPS:       {total_rps}  ({per_proc_rps}/enqueuer)")
-    print(f"Enqueue batch:    {enqueue_batch_size}")
+    print(f"Target RPS:       {total_rps}  ({per_proc_rps:.1f}/enqueuer)")
+    print(f"Planned enqueues: {total_enqueues}")
+    print(f"Max in-flight:    {max_inflight}  (per enqueuer)")
     print(f"Pool size/proc:   {pool_size}")
     print(f"Exec threads/wkr: {executor_threads}")
     print(f"Enqueue time:     {enqueue_time:.2f}s")
@@ -482,10 +509,10 @@ def main() -> None:
         "--duration", type=float, default=30.0, help="Enqueue phase duration in seconds"
     )
     parser.add_argument(
-        "--enqueue-batch",
+        "--max-inflight",
         type=int,
         default=100,
-        help="Concurrent enqueues per batch (Phase 1)",
+        help="Max concurrent in-flight enqueues per enqueuer (Phase 1)",
     )
     parser.add_argument(
         "--pool-size",
@@ -545,7 +572,7 @@ def main() -> None:
     run_multiprocess(
         args.rps,
         args.duration,
-        args.enqueue_batch,
+        args.max_inflight,
         args.pool_size,
         args.executor_threads,
         args.workers,

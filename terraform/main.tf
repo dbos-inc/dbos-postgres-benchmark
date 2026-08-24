@@ -232,6 +232,7 @@ resource "aws_db_instance" "postgres" {
   instance_class          = "db.m7i.4xlarge"
   allocated_storage       = 400
   storage_type            = "gp3"
+  storage_encrypted       = true
   db_name                 = "postgres"
   username                = local.db_username
   password                = local.db_password

@@ -526,7 +526,7 @@ def main() -> None:
     parser.add_argument(
         "--polling-interval",
         type=float,
-        default=1.0,
+        default=0.1,
         help="Queue polling interval in seconds (dequeue sweep cadence)",
     )
     parser.add_argument(

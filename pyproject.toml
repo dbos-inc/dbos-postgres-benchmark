@@ -5,7 +5,7 @@ description = "Postgres and DBOS benchmarks"
 requires-python = ">=3.14"
 dependencies = [
     "asyncpg>=0.29",
-    "dbos==2.30.0a10",
+    "dbos==2.31.0a7",
 ]
 
 [dependency-groups]

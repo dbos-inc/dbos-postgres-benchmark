@@ -1,7 +1,23 @@
-"""Benchmark DBOS queue.enqueue_async + completion throughput at a target rate.
+"""Benchmark DBOS queue enqueue + completion throughput at a target rate.
 
 Two-phase: enqueue all workflows at the target rate, then drain all completions.
 Reports both enqueue and end-to-end completion throughput.
+
+A single database-backed queue, registered once via ``DBOS.register_queue``, so
+every worker picks it up from the system database rather than declaring it
+locally.
+
+Enqueueing and execution are split across separate process pools, scaled
+independently:
+  * ``--enqueuers`` processes enqueue through a ``DBOSClient``. They never
+    launch the DBOS runtime, so they hold no queue threads and execute no
+    workflows -- they only write ENQUEUED rows to the system database.
+  * ``--workers`` processes launch the runtime and do nothing but dequeue and
+    execute. They enqueue nothing.
+
+Splitting the pools keeps the two sides from competing for the same process's
+event loop and connection pool, so a bottleneck on one side is visible rather
+than masked by the other.
 """
 
 import argparse
@@ -9,12 +25,21 @@ import asyncio
 import multiprocessing as mp
 import os
 import random
-import sys
 import time
 import uuid
 from urllib.parse import urlparse
 
 import asyncpg
+
+# The queue is database-backed, so the bootstrap process registers it and every
+# worker picks it up from the system database. Workers and enqueuers must share
+# the bootstrap app name: queues and workflows are owned by the application
+# that created them, and a worker only dequeues what its own application owns.
+APP_NAME = "dbos-queue-bench"
+QUEUE_NAME = "bench-queue"
+# Enqueuers hold no workflow code, so they name the target workflow by string.
+# Workers register under this exact name to match.
+WORKFLOW_NAME = "noop_workflow"
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -52,63 +77,54 @@ async def recreate_database() -> None:
         await conn.close()
 
 
-def bootstrap_schema_entry() -> None:
-    """Pre-create the DBOS system schema in a one-shot subprocess.
+def bootstrap_entry(worker_concurrency: int) -> None:
+    """Pre-create the DBOS system schema and register the queue, one-shot.
 
     Runs in its own spawned process so the parent never imports DBOS.
     Pre-running migrations eliminates the per-worker advisory-lock serialization
-    when many workers launch in parallel.
+    when many workers launch in parallel, and registering the queue here keeps
+    the workers from all racing to upsert the same row at startup. The client
+    never runs migrations, so enqueuers depend on this having run.
     """
     from dbos import DBOS, DBOSConfig
 
     config: DBOSConfig = {
-        "name": "dbos-queue-bench-bootstrap",
+        "name": APP_NAME,
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": 3,
     }
     DBOS(config=config)
     DBOS.launch()
+    # worker_concurrency is the per-executor cap, so the cluster-wide ceiling
+    # scales with --workers. No global limit: the point is to find where the
+    # database saturates, not to throttle before it does.
+    DBOS.register_queue(
+        QUEUE_NAME,
+        worker_concurrency=worker_concurrency,
+        on_conflict="always_update",
+    )
     DBOS.destroy()
 
 
 def worker_entry(
-    worker_id: int,
-    num_workers: int,
-    target_rps: int,
-    duration_s: float,
-    enqueue_batch_size: int,
     pool_size: int,
     executor_threads: int,
-    num_queues: int,
-    sample_rate: float,
     ready_barrier,
-    enqueue_done_barrier,
-    done_barrier,
-    result_queue: mp.Queue,
+    shutdown_event,
 ) -> None:
+    """Launch the DBOS runtime and execute dequeued workflows. Enqueues nothing."""
     # All DBOS code lives inside the worker process.
-    from dbos import DBOS, DBOSConfig, Queue
+    from dbos import DBOS, DBOSConfig
 
-    @DBOS.workflow()
+    # The explicit name is the contract with the enqueuers, which have no
+    # handle on this function and pass its name as a string.
+    @DBOS.workflow(name=WORKFLOW_NAME)
     async def noop_workflow() -> int:
         return 1
 
-    # Create all queues in every worker so any worker can enqueue to any queue.
-    # Workflows are enqueued to a random queue per call.
-    queues = [
-        Queue(f"bench-queue-{i}", worker_concurrency=1000) for i in range(num_queues)
-    ]
-
-    # Partition listening across workers. num_queues must divide num_workers,
-    # so each queue is listened to by exactly num_workers // num_queues workers.
-    assert (
-        num_workers % num_queues == 0
-    ), f"num_queues ({num_queues}) must divide num_workers ({num_workers})"
-    listen = [queues[worker_id % num_queues]]
-
     config: DBOSConfig = {
-        "name": "dbos-queue-bench",
+        "name": APP_NAME,
         "system_database_url": os.environ["BENCHMARK_DATABASE_URL"],
         "run_admin_server": False,
         "sys_db_pool_size": pool_size,
@@ -116,8 +132,43 @@ def worker_entry(
         "executor_id": str(uuid.uuid7()),
     }
     DBOS(config=config)
-    DBOS.listen_queues(listen)
+    # No listen_queues: without a filter, every worker polls every queue this
+    # application owns, which is exactly the one the bootstrap registered.
     DBOS.launch()
+
+    try:
+        # Wait until all processes are started before beginning the benchmark.
+        ready_barrier.wait()
+        # Nothing else to do here: the queue threads run in the background.
+        # Stay up until the parent reports the drain finished.
+        shutdown_event.wait()
+    finally:
+        DBOS.destroy()
+
+
+def enqueuer_entry(
+    enqueuer_id: int,
+    target_rps: int,
+    duration_s: float,
+    enqueue_batch_size: int,
+    pool_size: int,
+    drain_timeout: float,
+    sample_rate: float,
+    ready_barrier,
+    enqueue_done_barrier,
+    done_barrier,
+    result_queue: mp.Queue,
+) -> None:
+    """Enqueue through a DBOSClient. Never launches the DBOS runtime."""
+    from dbos import DBOSClient, EnqueueOptions
+
+    # application_name makes the enqueued rows owned by the same application
+    # the workers run as; without it they would never be dequeued.
+    client = DBOSClient(
+        system_database_url=os.environ["BENCHMARK_DATABASE_URL"],
+        system_database_pool_size=pool_size,
+        application_name=APP_NAME,
+    )
 
     # Wait until all processes are started before beginning the benchmark.
     ready_barrier.wait()
@@ -128,9 +179,15 @@ def worker_entry(
     async def enqueue_one() -> None:
         sampled = random.random() < sample_rate
         start = time.time() if sampled else 0.0
-        handle = await random.choice(queues).enqueue_async(noop_workflow)
+        options: EnqueueOptions = {
+            "queue_name": QUEUE_NAME,
+            "workflow_name": WORKFLOW_NAME,
+        }
+        # Client enqueues are synchronous DB writes dispatched to a thread, so
+        # in-flight enqueues per process are capped by the client pool size.
+        handle = await client.enqueue_async(options)
         if sampled:
-            samples.append((handle.workflow_id, start))
+            samples.append((handle.get_workflow_id(), start))
 
     async def enqueue_batch() -> int:
         # Fire all enqueues in this batch concurrently.
@@ -138,7 +195,7 @@ def worker_entry(
         return enqueue_batch_size
 
     async def run() -> dict:
-        DBOS.logger.info(f"Starting enqueue for worker {worker_id}")
+        print(f"Starting enqueue for enqueuer {enqueuer_id}", flush=True)
         batches_per_second = target_rps / enqueue_batch_size
         interval = 1.0 / batches_per_second
         total_batches = int(batches_per_second * duration_s)
@@ -148,7 +205,7 @@ def worker_entry(
 
         # --- Phase 1: enqueue at target rate ---
         # Record wall-clock start/end so the parent can compute elapsed across
-        # all workers as (last end - first start).
+        # all enqueuers as (last end - first start).
         enqueue_start_wall = time.time()
         loop_start = time.monotonic()
         for i in range(total_batches):
@@ -161,36 +218,73 @@ def worker_entry(
             except Exception:
                 enqueue_failures += 1
         enqueue_end_wall = time.time()
-        DBOS.logger.info(
+        print(
             f"[pid {os.getpid()}] enqueue done: "
             f"{enqueued} workflows in {enqueue_end_wall - enqueue_start_wall:.2f}s",
+            flush=True,
         )
 
-        # Wait for every worker to finish enqueueing before measuring drain.
-        # Run the synchronous barrier in a thread so in-flight workflows on
-        # this worker's event loop can continue making progress.
+        # Wait for every enqueuer to finish before measuring drain.
+        # Run the synchronous barrier in a thread so the event loop stays
+        # responsive.
         await asyncio.to_thread(enqueue_done_barrier.wait)
 
-        # --- Phase 2: drain (worker 0 polls list_workflows) ---
-        # Worker 0 polls until no ENQUEUED or PENDING workflows remain. Other
-        # workers just wait. This avoids per-handle get_result polling pressure
+        # --- Phase 2: drain (enqueuer 0 polls list_workflows) ---
+        # Enqueuer 0 polls until no ENQUEUED or PENDING workflows remain. The
+        # others just wait. This avoids per-handle get_result polling pressure
         # on the system DB.
         drain_start_wall = time.time()
         drain_end_wall = drain_start_wall
-        if worker_id == 0:
+        drain_timed_out = False
+        unfinished_remaining = 0
+        if enqueuer_id == 0:
+            polls = 0
             while True:
-                unfinished = await DBOS.list_workflows_async(
+                unfinished = await client.list_workflows_async(
                     status=["PENDING", "ENQUEUED"], limit=1
                 )
                 if not unfinished:
                     break
+                # A run that enqueues faster than the workers drain can spend
+                # far longer draining than enqueueing. Log progress, and bail
+                # out if the (optional) timeout is exceeded.
+                if drain_timeout > 0 and time.time() - drain_start_wall > drain_timeout:
+                    drain_timed_out = True
+                    break
+                polls += 1
+                if polls % 100 == 0:
+                    print(
+                        f"[pid {os.getpid()}] still draining after "
+                        f"{time.time() - drain_start_wall:.0f}s",
+                        flush=True,
+                    )
                 await asyncio.sleep(0.1)
             drain_end_wall = time.time()
-            DBOS.logger.info(
-                f"[pid {os.getpid()}] drain done in {drain_end_wall - drain_start_wall:.2f}s",
-            )
+            if drain_timed_out:
+                # Report how much actually finished so throughput isn't
+                # credited for workflows that never ran.
+                conn = await asyncpg.connect(os.environ["BENCHMARK_DATABASE_URL"])
+                try:
+                    unfinished_remaining = await conn.fetchval(
+                        "SELECT count(*) FROM dbos.workflow_status "
+                        "WHERE status IN ('PENDING', 'ENQUEUED')"
+                    )
+                finally:
+                    await conn.close()
+                print(
+                    f"[pid {os.getpid()}] drain timed out after "
+                    f"{drain_end_wall - drain_start_wall:.2f}s with "
+                    f"{unfinished_remaining} workflows unfinished",
+                    flush=True,
+                )
+            else:
+                print(
+                    f"[pid {os.getpid()}] drain done in "
+                    f"{drain_end_wall - drain_start_wall:.2f}s",
+                    flush=True,
+                )
 
-        # Sync so all workers wait until drain finishes before looking up samples.
+        # Sync so all enqueuers wait until drain finishes before looking up samples.
         await asyncio.to_thread(done_barrier.wait)
 
         # --- Latency lookup: for each sampled workflow, fetch updated_at ---
@@ -222,6 +316,8 @@ def worker_entry(
             "enqueue_end_wall": enqueue_end_wall,
             "drain_start_wall": drain_start_wall,
             "drain_end_wall": drain_end_wall,
+            "drain_timed_out": drain_timed_out,
+            "unfinished_remaining": unfinished_remaining,
             "latencies": latencies,
         }
 
@@ -229,7 +325,7 @@ def worker_entry(
         result = asyncio.run(run())
         result_queue.put(result)
     finally:
-        DBOS.destroy()
+        client.destroy()
 
 
 def run_multiprocess(
@@ -238,39 +334,56 @@ def run_multiprocess(
     enqueue_batch_size: int,
     pool_size: int,
     executor_threads: int,
-    processes: int,
-    num_queues: int,
+    num_workers: int,
+    num_enqueuers: int,
+    worker_concurrency: int,
+    drain_timeout: float,
     sample_rate: float,
 ) -> None:
     asyncio.run(recreate_database())
 
-    per_proc_rps = total_rps // processes
+    per_proc_rps = total_rps // num_enqueuers
 
     ctx = mp.get_context("spawn")
 
-    # Pre-create the DBOS schema in a single child so workers don't serialize
-    # on the migration advisory lock.
-    bootstrap = ctx.Process(target=bootstrap_schema_entry)
+    # Pre-create the DBOS schema and register the queue in a single child so
+    # workers don't serialize on the migration advisory lock.
+    bootstrap = ctx.Process(target=bootstrap_entry, args=(worker_concurrency,))
     bootstrap.start()
     bootstrap.join()
+    # Workers silently fall back to running migrations themselves if bootstrap
+    # dies, which hides the failure behind slow, serialized worker startup. A
+    # dead bootstrap also means no queue, so the run would fail anyway.
+    if bootstrap.exitcode != 0:
+        raise RuntimeError(f"schema bootstrap failed (exit {bootstrap.exitcode})")
 
     result_queue: mp.Queue = ctx.Queue()
-    ready_barrier = ctx.Barrier(processes)
-    enqueue_done_barrier = ctx.Barrier(processes)
-    done_barrier = ctx.Barrier(processes)
+    # Both pools sync on ready; the phase barriers are enqueuer-only.
+    ready_barrier = ctx.Barrier(num_workers + num_enqueuers)
+    enqueue_done_barrier = ctx.Barrier(num_enqueuers)
+    done_barrier = ctx.Barrier(num_enqueuers)
+    shutdown_event = ctx.Event()
+
     workers = []
-    for worker_id in range(processes):
+    for _ in range(num_workers):
         p = ctx.Process(
             target=worker_entry,
+            args=(pool_size, executor_threads, ready_barrier, shutdown_event),
+        )
+        p.start()
+        workers.append(p)
+
+    enqueuers = []
+    for enqueuer_id in range(num_enqueuers):
+        p = ctx.Process(
+            target=enqueuer_entry,
             args=(
-                worker_id,
-                processes,
+                enqueuer_id,
                 per_proc_rps,
                 duration_s,
                 enqueue_batch_size,
                 pool_size,
-                executor_threads,
-                num_queues,
+                drain_timeout,
                 sample_rate,
                 ready_barrier,
                 enqueue_done_barrier,
@@ -279,9 +392,13 @@ def run_multiprocess(
             ),
         )
         p.start()
-        workers.append(p)
+        enqueuers.append(p)
 
-    results = [result_queue.get() for _ in workers]
+    results = [result_queue.get() for _ in enqueuers]
+    for p in enqueuers:
+        p.join()
+    # The drain is over, so the workers have nothing left to execute.
+    shutdown_event.set()
     for p in workers:
         p.join()
 
@@ -293,18 +410,23 @@ def run_multiprocess(
     enqueue_time = last_enqueue_end - first_start
     drain_time = last_drain_end - last_enqueue_end
     total_time = last_drain_end - first_start
+    drain_timed_out = any(r["drain_timed_out"] for r in results)
+    unfinished = sum(r["unfinished_remaining"] for r in results)
+    completed = enqueued - unfinished
     enqueue_rps = enqueued / enqueue_time if enqueue_time > 0 else 0
-    completion_rps = enqueued / total_time if total_time > 0 else 0
+    completion_rps = completed / total_time if total_time > 0 else 0
     all_latencies: list[float] = []
     for r in results:
         all_latencies.extend(r["latencies"])
 
-    print(f"Processes:        {processes}")
-    print(f"Queues:           {num_queues}")
-    print(f"Target RPS:       {total_rps}  ({per_proc_rps}/proc)")
+    print(f"Workers:          {num_workers}   (runtime, execute only)")
+    print(f"Enqueuers:        {num_enqueuers}   (client, enqueue only)")
+    print(f"Queue:            {QUEUE_NAME}  (database-backed)")
+    print(f"Worker concurr.:  {worker_concurrency}  (per worker process)")
+    print(f"Target RPS:       {total_rps}  ({per_proc_rps}/enqueuer)")
     print(f"Enqueue batch:    {enqueue_batch_size}")
     print(f"Pool size/proc:   {pool_size}")
-    print(f"Exec threads/proc:{executor_threads}")
+    print(f"Exec threads/wkr: {executor_threads}")
     print(f"Enqueue time:     {enqueue_time:.2f}s")
     print(f"Drain time:       {drain_time:.2f}s")
     print(f"Total time:       {total_time:.2f}s")
@@ -312,6 +434,11 @@ def run_multiprocess(
     print(f"Enqueue failures: {enqueue_failures}")
     print(f"Enqueue RPS:      {enqueue_rps:.0f}")
     print(f"Completion RPS:   {completion_rps:.0f}   (end-to-end)")
+    if drain_timed_out:
+        print(
+            f"WARNING: drain timed out with {unfinished} workflows unfinished; "
+            f"completion RPS covers only the {completed} that finished."
+        )
     if all_latencies:
         print(
             f"Latency samples:  {len(all_latencies)}   "
@@ -340,22 +467,40 @@ def main() -> None:
         help="Concurrent enqueues per batch (Phase 1)",
     )
     parser.add_argument(
-        "--pool-size", type=int, default=3, help="DBOS system DB pool size per process"
+        "--pool-size",
+        type=int,
+        default=3,
+        help="System DB pool size per process (workers and enqueuers alike)",
     )
     parser.add_argument(
         "--executor-threads",
         type=int,
         default=512,
-        help="DBOS max_executor_threads per process",
+        help="DBOS max_executor_threads per worker process",
     )
     parser.add_argument(
-        "--processes", type=int, default=128, help="Number of worker processes"
-    )
-    parser.add_argument(
-        "--queues",
+        "--workers",
         type=int,
-        default=1,
-        help="Number of queue shards (workers are assigned round-robin)",
+        default=8,
+        help="Number of worker processes (launch the DBOS runtime, execute workflows)",
+    )
+    parser.add_argument(
+        "--enqueuers",
+        type=int,
+        default=64,
+        help="Number of enqueuer processes (DBOSClient only, no DBOS runtime)",
+    )
+    parser.add_argument(
+        "--worker-concurrency",
+        type=int,
+        default=1000,
+        help="Max concurrent workflows from the queue per worker process",
+    )
+    parser.add_argument(
+        "--drain-timeout",
+        type=float,
+        default=0.0,
+        help="Give up on the drain phase after this many seconds (0 = never)",
     )
     parser.add_argument(
         "--sample-rate",
@@ -370,8 +515,10 @@ def main() -> None:
         args.enqueue_batch,
         args.pool_size,
         args.executor_threads,
-        args.processes,
-        args.queues,
+        args.workers,
+        args.enqueuers,
+        args.worker_concurrency,
+        args.drain_timeout,
         args.sample_rate,
     )
 

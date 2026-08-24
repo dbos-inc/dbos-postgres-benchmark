@@ -21,8 +21,9 @@ resource "random_password" "db" {
 }
 
 locals {
-  db_username = "postgres"
-  db_password = random_password.db.result
+  db_username   = "postgres"
+  db_password   = random_password.db.result
+  db_identifier = "dbos-bench-postgres"
 }
 
 # --- Variables ---
@@ -73,6 +74,28 @@ resource "aws_security_group" "rds" {
   }
 
   tags = { Name = "dbos-bench-rds-sg" }
+}
+
+# --- CloudWatch log groups for the RDS log exports ---
+#
+# RDS creates these implicitly on first export, but AWS-created groups are not
+# in Terraform state, never expire, and survive `terraform destroy` -- so the
+# exported logs would outlive the cluster and keep billing. Declaring them here
+# puts them under Terraform's lifecycle: destroy deletes them and their data.
+#
+# NOT declared here: the RDSOSMetrics log group that Enhanced Monitoring writes
+# to. It is account-wide and shared by every RDS instance, so managing it here
+# would make `terraform destroy` delete other instances' monitoring data. It
+# already carries a 30-day retention, so its data ages out on its own.
+
+resource "aws_cloudwatch_log_group" "rds_postgresql" {
+  name              = "/aws/rds/instance/${local.db_identifier}/postgresql"
+  retention_in_days = 7
+}
+
+resource "aws_cloudwatch_log_group" "rds_upgrade" {
+  name              = "/aws/rds/instance/${local.db_identifier}/upgrade"
+  retention_in_days = 7
 }
 
 # --- Enhanced Monitoring IAM role ---
@@ -195,9 +218,16 @@ resource "aws_db_parameter_group" "postgres" {
 # --- RDS (db.m7i.4xlarge) ---
 
 resource "aws_db_instance" "postgres" {
-  identifier     = "dbos-bench-postgres"
+  identifier     = local.db_identifier
   engine         = "postgres"
   engine_version = "18"
+
+  # Create the log groups first so RDS adopts the retention-bounded, Terraform-
+  # managed groups instead of implicitly creating never-expiring ones.
+  depends_on = [
+    aws_cloudwatch_log_group.rds_postgresql,
+    aws_cloudwatch_log_group.rds_upgrade,
+  ]
 
   instance_class          = "db.m7i.4xlarge"
   allocated_storage       = 400

@@ -105,13 +105,28 @@ def percentile(values: list[float], pct: float) -> float:
 
 
 async def recreate_database() -> None:
-    """Drop and recreate the benchmark database via POSTGRES_DATABASE_URL."""
+    """Drop and recreate the benchmark database via POSTGRES_DATABASE_URL.
+
+    pg_stat_statements is preloaded cluster-wide but the extension itself is
+    per-database, so dropping the database drops it too. Re-create it here or
+    every run would start with no query statistics.
+    """
     admin_url = os.environ["POSTGRES_DATABASE_URL"]
-    bench_db = urlparse(os.environ["BENCHMARK_DATABASE_URL"]).path.lstrip("/")
+    bench_url = os.environ["BENCHMARK_DATABASE_URL"]
+    bench_db = urlparse(bench_url).path.lstrip("/")
     conn = await asyncpg.connect(admin_url)
     try:
         await conn.execute(f'DROP DATABASE IF EXISTS "{bench_db}" WITH (FORCE)')
         await conn.execute(f'CREATE DATABASE "{bench_db}"')
+    finally:
+        await conn.close()
+    conn = await asyncpg.connect(bench_url)
+    try:
+        await conn.execute("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+    except asyncpg.PostgresError as e:
+        # Non-fatal: the benchmark still runs, just without query stats. Hit on
+        # a server where the library is not preloaded (e.g. a local Postgres).
+        print(f"warning: could not enable pg_stat_statements: {e}", flush=True)
     finally:
         await conn.close()
 

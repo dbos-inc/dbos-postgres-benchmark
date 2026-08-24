@@ -75,17 +75,41 @@ resource "aws_security_group" "rds" {
   tags = { Name = "dbos-bench-rds-sg" }
 }
 
-# --- RDS (db.m7i.24xlarge) ---
+# --- RDS (db.m7i.24xlarge) --- (original, high-end config)
+#
+# resource "aws_db_instance" "postgres" {
+#   identifier     = "dbos-bench-postgres"
+#   engine         = "postgres"
+#   engine_version = "18"
+#
+#   instance_class          = "db.m7i.24xlarge"
+#   allocated_storage       = 300
+#   storage_type            = "io2"
+#   iops                    = 120000
+#   db_name                 = "postgres"
+#   username                = local.db_username
+#   password                = local.db_password
+#   port                    = 5432
+#   availability_zone       = "${var.aws_region}a"
+#   publicly_accessible     = false
+#   skip_final_snapshot     = true
+#   backup_retention_period = 0
+#   apply_immediately       = true
+#   vpc_security_group_ids  = [aws_security_group.rds.id]
+#
+#   tags = { Name = "dbos-bench-postgres" }
+# }
+
+# --- RDS (db.m7i.4xlarge) ---
 
 resource "aws_db_instance" "postgres" {
   identifier     = "dbos-bench-postgres"
   engine         = "postgres"
   engine_version = "18"
 
-  instance_class          = "db.m7i.24xlarge"
-  allocated_storage       = 300
-  storage_type            = "io2"
-  iops                    = 120000
+  instance_class    = "db.m7i.4xlarge"
+  allocated_storage = 400
+  storage_type      = "gp3"
   db_name                 = "postgres"
   username                = local.db_username
   password                = local.db_password

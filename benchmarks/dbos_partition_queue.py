@@ -5,8 +5,8 @@ then drain all completions. Reports both enqueue and end-to-end completion
 throughput.
 
 Two differences. First, a single database-backed queue, registered once via
-``DBOS.register_queue`` with ``partition_queue=True``, so concurrency limits
-apply *per partition* rather than to the queue as a whole. Each enqueue picks a
+``DBOS.register_queue`` with ``partition_concurrency``, so the limit applies
+*per partition* rather than to the queue as a whole. Each enqueue picks a
 partition key uniformly at random from ``--partitions`` keys.
 
 Second, enqueueing and execution are split across separate process pools:
@@ -17,7 +17,8 @@ Second, enqueueing and execution are split across separate process pools:
     execute. They enqueue nothing.
 
 Throughput notes:
-  * With ``--concurrency 1`` (the default) DBOS takes the batched dequeue path:
+  * With ``--concurrency 1`` (the default, i.e. ``partition_concurrency=1``)
+    DBOS takes the batched dequeue path:
     one transaction per poll claims the head-of-line workflow of every
     partition. The rough ceiling is therefore
     ``partitions * concurrency / polling_interval`` workflows/sec, so a run
@@ -88,13 +89,9 @@ def bootstrap_entry(concurrency: int, polling_interval: float) -> None:
     }
     DBOS(config=config)
     DBOS.launch()
-    # On a partitioned queue `concurrency` is the global (cluster-wide) limit
-    # *per partition*. worker_concurrency is left unset: it may not exceed
-    # concurrency, and setting it would also disable the batched dequeue path.
     DBOS.register_queue(
         QUEUE_NAME,
-        concurrency=concurrency,
-        partition_queue=True,
+        partition_concurrency=concurrency,
         polling_interval_sec=polling_interval,
         on_conflict="always_update",
     )
@@ -429,7 +426,7 @@ def run_multiprocess(
     print(f"Enqueuers:        {num_enqueuers}   (client, enqueue only)")
     print(f"Queue:            {QUEUE_NAME}  (partitioned, database-backed)")
     print(f"Partitions:       {num_partitions}")
-    print(f"Concurrency:      {concurrency}  (global, per partition)")
+    print(f"Concurrency:      {concurrency}  (partition_concurrency)")
     print(f"Polling interval: {polling_interval}s")
     print(f"Dequeue ceiling:  ~{ceiling:.0f} workflows/sec")
     print(f"Target RPS:       {total_rps}  ({per_proc_rps}/enqueuer)")
@@ -509,7 +506,7 @@ def main() -> None:
         "--concurrency",
         type=int,
         default=1,
-        help="Global concurrency limit per partition (default 1)",
+        help="Per-partition global concurrency limit, i.e. partition_concurrency (default 1)",
     )
     parser.add_argument(
         "--polling-interval",

@@ -183,6 +183,12 @@ def gc_entry(
     thread for a connection. One process per run, not a pool: concurrent sweeps
     would contend on the same rows and the round times would measure that
     contention rather than the collector.
+
+    Every round is independent and failure is per-round: a sweep that raises is
+    counted, logged and retried at the next grid slot on a fresh handle, so a
+    collector that hits a dead connection, a lock timeout or a restarted
+    database keeps running instead of leaving the rest of the benchmark with no
+    GC at all.
     """
     import sqlalchemy as sa
     from dbos._serialization import DefaultSerializer
@@ -192,27 +198,35 @@ def gc_entry(
     # app_name is the same contract the workers and enqueuers share: GC filters
     # on it, so a name that doesn't match sweeps nothing and every round reports
     # 0 deleted while the table grows.
-    sys_db = SystemDatabase.create(
-        system_database_url=os.environ["BENCHMARK_DATABASE_URL"],
-        engine_kwargs={
-            "connect_args": {"application_name": "dbos_queue_bench_gc"},
-            "pool_timeout": 30,
-            "max_overflow": 0,
-            "pool_size": pool_size,
-            "pool_pre_ping": True,
-        },
-        engine=None,
-        schema="dbos",
-        serializer=DefaultSerializer(),
-        executor_id=None,
-        # Nothing here waits on a notification, so a listener would only hold an
-        # idle connection open for the length of the run.
-        use_listen_notify=False,
-        app_name=APP_NAME,
-    )
-    # Fail here rather than inside the first round, where the failure would look
-    # like a slow sweep.
-    sys_db.check_connection()
+    def connect():
+        db = SystemDatabase.create(
+            system_database_url=os.environ["BENCHMARK_DATABASE_URL"],
+            engine_kwargs={
+                "connect_args": {"application_name": "dbos_queue_bench_gc"},
+                "pool_timeout": 30,
+                "max_overflow": 0,
+                "pool_size": pool_size,
+                "pool_pre_ping": True,
+            },
+            engine=None,
+            schema="dbos",
+            serializer=DefaultSerializer(),
+            executor_id=None,
+            # Nothing here waits on a notification, so a listener would only
+            # hold an idle connection open for the length of the run.
+            use_listen_notify=False,
+            app_name=APP_NAME,
+        )
+        db.check_connection()
+        return db
+
+    def close(db) -> None:
+        try:
+            db.destroy()
+        except Exception:
+            # Already-dead connections raise on teardown; the handle is being
+            # thrown away either way.
+            pass
 
     # How much a round removed, read from the statistics collector: count(*)
     # over workflow_status is a sequential scan that would cost more than the
@@ -223,19 +237,31 @@ def gc_entry(
         "WHERE schemaname = 'dbos' AND relname = 'workflow_status'"
     )
 
-    def deleted_so_far() -> int:
-        with sys_db.engine.connect() as c:
+    def deleted_so_far(db) -> int:
+        with db.engine.connect() as c:
             return c.execute(deleted_sql).scalar() or 0
 
     window_s = gc_minutes * 60.0
     rounds: list[float] = []
     deleted_per_round: list[int] = []
+    failures = 0
+    last_error = ""
+    sys_db = None
+    prev_deleted = 0
     try:
         # Wait until all processes are started before beginning the benchmark.
+        # Before the database, deliberately: this process is one of the
+        # barrier's parties, so failing ahead of it would leave every worker and
+        # enqueuer waiting on a barrier that can never fill. A collector that
+        # cannot connect should cost the run its GC, not hang the run.
         ready_barrier.wait()
-        prev_deleted = deleted_so_far()
         grid_start = time.monotonic()
+        # Counts every attempt, not just the ones that swept: a round that
+        # raises gives its slot up and waits for the next rather than spinning
+        # against a database that is already unhappy.
+        slot = 0
         while True:
+            slot += 1
             # Rounds sit on a fixed grid one window apart, anchored at the
             # barrier, with the first one window in -- before that nothing is
             # old enough to collect. A grid rather than a sleep after each
@@ -243,46 +269,92 @@ def gc_entry(
             # by the next, so a collector falling behind shows up as round
             # times above the interval instead of quietly stretching the
             # schedule and shrinking the backlog each round has to clear.
-            wait = grid_start + len(rounds) * window_s + window_s - time.monotonic()
+            wait = grid_start + slot * window_s - time.monotonic()
             # Waiting on the event rather than sleeping gives the run back at
             # shutdown instead of holding it for the rest of the window.
             if wait > 0:
                 shutdown_event.wait(wait)
             if shutdown_event.is_set():
                 break
-            # Relative to now, not to the grid: a round that started late still
-            # collects everything that has aged out by the time it runs, rather
-            # than leaving the overrun behind for the next round.
-            cutoff_ms = int((time.time() - window_s) * 1000)
-            start = time.monotonic()
-            sys_db.garbage_collect(
-                cutoff_epoch_timestamp_ms=cutoff_ms,
-                rows_threshold=None,
-                batch_size=DEFAULT_GC_BATCH_SIZE,
-            )
-            elapsed = time.monotonic() - start
-            now_deleted = deleted_so_far()
+            attempt_start = time.monotonic()
+            try:
+                if sys_db is None:
+                    # First round, or a previous one left the handle suspect.
+                    # Connecting costs far less than a window, so it happens
+                    # here rather than up front, where a database that is not
+                    # up yet would cost the run its collector outright.
+                    sys_db = connect()
+                    prev_deleted = deleted_so_far(sys_db)
+                # Timed from here so the round time stays the sweep, not a
+                # reconnect an earlier failure forced.
+                start = time.monotonic()
+                # Relative to now, not to the grid: a round that started late
+                # still collects everything that has aged out by the time it
+                # runs, rather than leaving the overrun to the next round.
+                cutoff_ms = int((time.time() - window_s) * 1000)
+                sys_db.garbage_collect(
+                    cutoff_epoch_timestamp_ms=cutoff_ms,
+                    rows_threshold=None,
+                    batch_size=DEFAULT_GC_BATCH_SIZE,
+                )
+                elapsed = time.monotonic() - start
+            except Exception as e:
+                # A raised sweep costs this round, not the run. Batches that
+                # already committed stay collected, and because the cutoff is
+                # recomputed every round, the next slot picks up both its own
+                # workflows and whatever this one should have taken.
+                failures += 1
+                last_error = f"{type(e).__name__}: {e}"
+                print(
+                    f"[gc] round {slot} failed after "
+                    f"{time.monotonic() - attempt_start:.2f}s: {last_error}",
+                    flush=True,
+                )
+                # The handle may be pooling dead connections, so drop it and
+                # let the next round build a fresh one.
+                if sys_db is not None:
+                    close(sys_db)
+                    sys_db = None
+                continue
+            try:
+                now_deleted = deleted_so_far(sys_db)
+            except Exception:
+                # The sweep landed; only the tally is missing. Carrying the
+                # old value defers those deletes to whichever round next reads
+                # the counter instead of losing them.
+                now_deleted = prev_deleted
             rounds.append(elapsed)
-            deleted_per_round.append(now_deleted - prev_deleted)
+            # Clamped: a database that restarted mid-run resets the counter,
+            # and a negative delta would silently eat an earlier round's total.
+            deleted_per_round.append(max(0, now_deleted - prev_deleted))
             prev_deleted = now_deleted
             print(
-                f"[gc] round {len(rounds)}: {elapsed:.2f}s, "
+                f"[gc] round {slot}: {elapsed:.2f}s, "
                 f"{deleted_per_round[-1]} workflows deleted",
                 flush=True,
             )
         # Deletes the collector had not published when the final round ended
         # are credited here, so the run total is right even if that round's
         # own tally is short.
-        if deleted_per_round:
-            deleted_per_round[-1] += max(0, deleted_so_far() - prev_deleted)
+        if deleted_per_round and sys_db is not None:
+            try:
+                deleted_per_round[-1] += max(0, deleted_so_far(sys_db) - prev_deleted)
+            except Exception:
+                pass
     finally:
+        # In the finally so the parent's blocking get() is always satisfied:
+        # without it, a collector that died on the way in would hang the run at
+        # the point where it collects results.
         result_queue.put(
             {
                 "rounds": rounds,
                 "deleted": sum(deleted_per_round),
+                "failures": failures,
+                "last_error": last_error,
             }
         )
-        sys_db.destroy()
+        if sys_db is not None:
+            close(sys_db)
 
 
 def enqueuer_entry(
@@ -695,10 +767,18 @@ def run_multiprocess(
                 f"GC deleted:       {gc_result['deleted']} workflows   "
                 f"({gc_result['deleted']/len(gc_rounds):.0f}/round)"
             )
+        elif gc_result["failures"]:
+            print("GC rounds:        0   (every attempt failed)")
         else:
             print(
                 f"GC rounds:        0   (the run ended inside the first "
                 f"{gc_minutes:g}-minute window)"
+            )
+        if gc_result["failures"]:
+            print(
+                f"GC failures:      {gc_result['failures']}   (rounds that "
+                f"raised and were retried at the next slot; "
+                f"last: {gc_result['last_error']})"
             )
 
 

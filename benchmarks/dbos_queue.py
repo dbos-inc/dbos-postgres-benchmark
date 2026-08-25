@@ -18,6 +18,13 @@ independently:
 Splitting the pools keeps the two sides from competing for the same process's
 event loop and connection pool, so a bottleneck on one side is visible rather
 than masked by the other.
+
+``--gc N`` adds a third, single process that every N minutes sweeps completed
+workflows older than N minutes out of the system database, for the whole run.
+The window is both the retention and the period, so each round faces one
+window's worth of finished workflows and the round times say whether the
+collector keeps up. Enqueue and completion throughput are then measured while
+it deletes underneath them.
 """
 
 import argparse
@@ -144,6 +151,123 @@ def worker_entry(
         shutdown_event.wait()
     finally:
         DBOS.destroy()
+
+
+def gc_entry(
+    gc_minutes: float,
+    pool_size: int,
+    ready_barrier,
+    shutdown_event,
+    result_queue: mp.Queue,
+) -> None:
+    """Every gc_minutes, sweep workflows older than gc_minutes, for the whole run.
+
+    Drives a SystemDatabase built here rather than a launched runtime: garbage
+    collection is all this process does, so it registers no workflow, runs no
+    queue thread and dequeues nothing -- the sweep never waits behind a queue
+    thread for a connection. One process per run, not a pool: concurrent sweeps
+    would contend on the same rows and the round times would measure that
+    contention rather than the collector.
+    """
+    import sqlalchemy as sa
+    from dbos._serialization import DefaultSerializer
+    from dbos._sys_db import SystemDatabase
+    from dbos._workflow_commands import DEFAULT_GC_BATCH_SIZE
+
+    # app_name is the same contract the workers and enqueuers share: GC filters
+    # on it, so a name that doesn't match sweeps nothing and every round reports
+    # 0 deleted while the table grows.
+    sys_db = SystemDatabase.create(
+        system_database_url=os.environ["BENCHMARK_DATABASE_URL"],
+        engine_kwargs={
+            "connect_args": {"application_name": "dbos_queue_bench_gc"},
+            "pool_timeout": 30,
+            "max_overflow": 0,
+            "pool_size": pool_size,
+            "pool_pre_ping": True,
+        },
+        engine=None,
+        schema="dbos",
+        serializer=DefaultSerializer(),
+        executor_id=None,
+        # Nothing here waits on a notification, so a listener would only hold an
+        # idle connection open for the length of the run.
+        use_listen_notify=False,
+        app_name=APP_NAME,
+    )
+    # Fail here rather than inside the first round, where the failure would look
+    # like a slow sweep.
+    sys_db.check_connection()
+
+    # How much a round removed, read from the statistics collector: count(*)
+    # over workflow_status is a sequential scan that would cost more than the
+    # sweep it is measuring. Publication lags by up to a second, so a batch can
+    # land on the next round's tally; the run total is reconciled at the end.
+    deleted_sql = sa.text(
+        "SELECT n_tup_del FROM pg_stat_user_tables "
+        "WHERE schemaname = 'dbos' AND relname = 'workflow_status'"
+    )
+
+    def deleted_so_far() -> int:
+        with sys_db.engine.connect() as c:
+            return c.execute(deleted_sql).scalar() or 0
+
+    window_s = gc_minutes * 60.0
+    rounds: list[float] = []
+    deleted_per_round: list[int] = []
+    try:
+        # Wait until all processes are started before beginning the benchmark.
+        ready_barrier.wait()
+        prev_deleted = deleted_so_far()
+        grid_start = time.monotonic()
+        while True:
+            # Rounds sit on a fixed grid one window apart, anchored at the
+            # barrier, with the first one window in -- before that nothing is
+            # old enough to collect. A grid rather than a sleep after each
+            # round: a sweep that overruns its window is followed immediately
+            # by the next, so a collector falling behind shows up as round
+            # times above the interval instead of quietly stretching the
+            # schedule and shrinking the backlog each round has to clear.
+            wait = grid_start + len(rounds) * window_s + window_s - time.monotonic()
+            # Waiting on the event rather than sleeping gives the run back at
+            # shutdown instead of holding it for the rest of the window.
+            if wait > 0:
+                shutdown_event.wait(wait)
+            if shutdown_event.is_set():
+                break
+            # Relative to now, not to the grid: a round that started late still
+            # collects everything that has aged out by the time it runs, rather
+            # than leaving the overrun behind for the next round.
+            cutoff_ms = int((time.time() - window_s) * 1000)
+            start = time.monotonic()
+            sys_db.garbage_collect(
+                cutoff_epoch_timestamp_ms=cutoff_ms,
+                rows_threshold=None,
+                batch_size=DEFAULT_GC_BATCH_SIZE,
+            )
+            elapsed = time.monotonic() - start
+            now_deleted = deleted_so_far()
+            rounds.append(elapsed)
+            deleted_per_round.append(now_deleted - prev_deleted)
+            prev_deleted = now_deleted
+            print(
+                f"[gc] round {len(rounds)}: {elapsed:.2f}s, "
+                f"{deleted_per_round[-1]} workflows deleted",
+                flush=True,
+            )
+        # Deletes the collector had not published when the final round ended
+        # are credited here, so the run total is right even if that round's
+        # own tally is short.
+        if deleted_per_round:
+            deleted_per_round[-1] += max(0, deleted_so_far() - prev_deleted)
+    finally:
+        result_queue.put(
+            {
+                "rounds": rounds,
+                "deleted": sum(deleted_per_round),
+            }
+        )
+        sys_db.destroy()
 
 
 def enqueuer_entry(
@@ -308,6 +432,7 @@ def enqueuer_entry(
 
         # --- Latency lookup: for each sampled workflow, fetch updated_at ---
         latencies: list[float] = []
+        samples_missing = 0
         if samples:
             conn = await asyncpg.connect(os.environ["BENCHMARK_DATABASE_URL"])
             try:
@@ -323,6 +448,12 @@ def enqueuer_entry(
             for wf_id, start in samples:
                 ua = updated_at_by_id.get(wf_id)
                 if ua is None:
+                    # Every enqueued workflow has a row, so a missing one was
+                    # collected between its completion and this lookup. Counted
+                    # rather than skipped: silently dropping them would shrink
+                    # the percentiles to whatever GC's retention window left
+                    # behind, with nothing in the output to say so.
+                    samples_missing += 1
                     continue
                 # updated_at is epoch milliseconds
                 completed_at_s = float(ua) / 1000.0
@@ -338,6 +469,7 @@ def enqueuer_entry(
             "drain_timed_out": drain_timed_out,
             "unfinished_remaining": unfinished_remaining,
             "latencies": latencies,
+            "samples_missing": samples_missing,
         }
 
     try:
@@ -358,6 +490,7 @@ def run_multiprocess(
     worker_concurrency: int,
     drain_timeout: float,
     sample_rate: float,
+    gc_minutes: float,
 ) -> None:
     asyncio.run(recreate_database())
 
@@ -383,11 +516,28 @@ def run_multiprocess(
         raise RuntimeError(f"schema bootstrap failed (exit {bootstrap.exitcode})")
 
     result_queue: mp.Queue = ctx.Queue()
-    # Both pools sync on ready; the phase barriers are enqueuer-only.
-    ready_barrier = ctx.Barrier(num_workers + num_enqueuers)
+    gc_result_queue: mp.Queue = ctx.Queue()
+    gc_enabled = gc_minutes > 0
+    # Both pools and the collector sync on ready; the phase barriers are
+    # enqueuer-only.
+    ready_barrier = ctx.Barrier(num_workers + num_enqueuers + (1 if gc_enabled else 0))
     enqueue_done_barrier = ctx.Barrier(num_enqueuers)
     done_barrier = ctx.Barrier(num_enqueuers)
     shutdown_event = ctx.Event()
+
+    gc_proc = None
+    if gc_enabled:
+        gc_proc = ctx.Process(
+            target=gc_entry,
+            args=(
+                gc_minutes,
+                pool_size,
+                ready_barrier,
+                shutdown_event,
+                gc_result_queue,
+            ),
+        )
+        gc_proc.start()
 
     workers = []
     for _ in range(num_workers):
@@ -423,10 +573,16 @@ def run_multiprocess(
     results = [result_queue.get() for _ in enqueuers]
     for p in enqueuers:
         p.join()
-    # The drain is over, so the workers have nothing left to execute.
+    # The drain is over, so the workers have nothing left to execute and the
+    # collector nothing left to collect.
     shutdown_event.set()
     for p in workers:
         p.join()
+    gc_result = None
+    if gc_proc is not None:
+        # Blocks out whichever round was in flight when shutdown was signalled.
+        gc_result = gc_result_queue.get()
+        gc_proc.join()
 
     enqueued = sum(r["enqueued"] for r in results)
     enqueue_failures = sum(r["enqueue_failures"] for r in results)
@@ -441,6 +597,7 @@ def run_multiprocess(
     completed = enqueued - unfinished
     enqueue_rps = enqueued / enqueue_time if enqueue_time > 0 else 0
     completion_rps = completed / total_time if total_time > 0 else 0
+    samples_missing = sum(r["samples_missing"] for r in results)
     all_latencies: list[float] = []
     for r in results:
         all_latencies.extend(r["latencies"])
@@ -454,6 +611,13 @@ def run_multiprocess(
     print(f"Max in-flight:    {max_inflight}  (per enqueuer)")
     print(f"Pool size/proc:   {pool_size}")
     print(f"Exec threads/wkr: {executor_threads}")
+    if gc_enabled:
+        print(
+            f"GC:               every {gc_minutes:g} min, "
+            f"older than {gc_minutes:g} min  (1 process)"
+        )
+    else:
+        print("GC:               off")
     print(f"Enqueue time:     {enqueue_time:.2f}s")
     print(f"Drain time:       {drain_time:.2f}s")
     print(f"Total time:       {total_time:.2f}s")
@@ -474,6 +638,30 @@ def run_multiprocess(
             f"p99={percentile(all_latencies, 99)*1000:.1f}ms "
             f"max={max(all_latencies)*1000:.1f}ms"
         )
+    if samples_missing:
+        print(
+            f"Samples GC'd:     {samples_missing}   (sampled workflows collected "
+            f"before the lookup; percentiles cover the survivors only)"
+        )
+    if gc_result is not None:
+        gc_rounds = gc_result["rounds"]
+        if gc_rounds:
+            print(f"GC rounds:        {len(gc_rounds)}")
+            print(
+                f"GC round time:    p50={percentile(gc_rounds, 50):.2f}s "
+                f"p95={percentile(gc_rounds, 95):.2f}s "
+                f"max={max(gc_rounds):.2f}s "
+                f"mean={sum(gc_rounds)/len(gc_rounds):.2f}s"
+            )
+            print(
+                f"GC deleted:       {gc_result['deleted']} workflows   "
+                f"({gc_result['deleted']/len(gc_rounds):.0f}/round)"
+            )
+        else:
+            print(
+                f"GC rounds:        0   (the run ended inside the first "
+                f"{gc_minutes:g}-minute window)"
+            )
 
 
 def main() -> None:
@@ -535,6 +723,17 @@ def main() -> None:
         default=0.01,
         help="Fraction of workflows sampled for latency measurement (default 0.01)",
     )
+    parser.add_argument(
+        "--gc",
+        type=float,
+        default=0.0,
+        dest="gc_minutes",
+        help="Every N minutes, garbage-collect workflows older than N minutes, "
+        "from one dedicated process for the whole run (0 = no GC). Only finished "
+        "workflows are eligible, so nothing the run still has to drain is ever "
+        "collected. Keep N well under --duration or the run ends before the "
+        "first round: at 30 a 5-minute run never sweeps at all",
+    )
     args = parser.parse_args()
     run_multiprocess(
         args.rps,
@@ -547,6 +746,7 @@ def main() -> None:
         args.worker_concurrency,
         args.drain_timeout,
         args.sample_rate,
+        args.gc_minutes,
     )
 
 

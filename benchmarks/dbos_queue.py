@@ -19,12 +19,14 @@ Splitting the pools keeps the two sides from competing for the same process's
 event loop and connection pool, so a bottleneck on one side is visible rather
 than masked by the other.
 
-``--gc N`` adds a third, single process that every N minutes sweeps completed
-workflows older than N minutes out of the system database, for the whole run.
-The window is both the retention and the period, so each round faces one
-window's worth of finished workflows and the round times say whether the
-collector keeps up. Enqueue and completion throughput are then measured while
-it deletes underneath them.
+``--gc N`` adds a third, single process that sweeps completed workflows older
+than N minutes out of the system database, for the whole run. It runs every
+``--gc-interval`` minutes, which defaults to N: at the default each round faces
+exactly one retention window's worth of finished workflows, and the round times
+say whether the collector keeps up. Setting the interval apart from the
+retention separates the two questions -- how much backlog a sweep clears, and
+how often it is asked to. Enqueue and completion throughput are then measured
+while it deletes underneath them.
 """
 
 import argparse
@@ -170,12 +172,13 @@ def worker_entry(
 
 def gc_entry(
     gc_minutes: float,
+    gc_interval: float,
     pool_size: int,
     ready_barrier,
     shutdown_event,
     result_queue: mp.Queue,
 ) -> None:
-    """Every gc_minutes, sweep workflows older than gc_minutes, for the whole run.
+    """Every gc_interval minutes, sweep workflows older than gc_minutes.
 
     Drives a SystemDatabase built here rather than a launched runtime: garbage
     collection is all this process does, so it registers no workflow, runs no
@@ -230,8 +233,12 @@ def gc_entry(
 
     # How much a round removed, read from the statistics collector: count(*)
     # over workflow_status is a sequential scan that would cost more than the
-    # sweep it is measuring. Publication lags by up to a second, so a batch can
-    # land on the next round's tally; the run total is reconciled at the end.
+    # sweep it is measuring. The counter is published on a delay the reader
+    # cannot force -- pg_stat_force_next_flush only flushes the calling backend,
+    # and the deletes commit on another pooled connection -- so a sweep that
+    # finishes fast can read its own work as not yet done and hand the whole
+    # tally to the next round. Per-round counts are therefore attribution, not
+    # measurement; the run total is exact and reconciled at the end.
     deleted_sql = sa.text(
         "SELECT n_tup_del FROM pg_stat_user_tables "
         "WHERE schemaname = 'dbos' AND relname = 'workflow_status'"
@@ -241,13 +248,19 @@ def gc_entry(
         with db.engine.connect() as c:
             return c.execute(deleted_sql).scalar() or 0
 
-    window_s = gc_minutes * 60.0
+    # Two independent clocks: retention_s decides what a sweep may delete,
+    # period_s decides how often one runs. Equal by default, and only then does
+    # a round face exactly one window's backlog -- a shorter interval splits
+    # that window across several rounds, a longer one hands each round more
+    # than a window's worth.
+    retention_s = gc_minutes * 60.0
+    period_s = gc_interval * 60.0
     rounds: list[float] = []
     deleted_per_round: list[int] = []
     failures = 0
     last_error = ""
     sys_db = None
-    prev_deleted = 0
+    prev_deleted = None
     try:
         # Wait until all processes are started before beginning the benchmark.
         # Before the database, deliberately: this process is one of the
@@ -262,14 +275,14 @@ def gc_entry(
         slot = 0
         while True:
             slot += 1
-            # Rounds sit on a fixed grid one window apart, anchored at the
-            # barrier, with the first one window in -- before that nothing is
-            # old enough to collect. A grid rather than a sleep after each
-            # round: a sweep that overruns its window is followed immediately
-            # by the next, so a collector falling behind shows up as round
-            # times above the interval instead of quietly stretching the
-            # schedule and shrinking the backlog each round has to clear.
-            wait = grid_start + slot * window_s - time.monotonic()
+            # Rounds sit on a fixed grid one interval apart, anchored at the
+            # barrier, with the first one interval in. A grid rather than a
+            # sleep after each round: a sweep that overruns its interval is
+            # followed immediately by the next, so a collector falling behind
+            # shows up as round times above the interval instead of quietly
+            # stretching the schedule and shrinking the backlog each round has
+            # to clear.
+            wait = grid_start + slot * period_s - time.monotonic()
             # Waiting on the event rather than sleeping gives the run back at
             # shutdown instead of holding it for the rest of the window.
             if wait > 0:
@@ -284,14 +297,20 @@ def gc_entry(
                     # here rather than up front, where a database that is not
                     # up yet would cost the run its collector outright.
                     sys_db = connect()
-                    prev_deleted = deleted_so_far(sys_db)
+                    if prev_deleted is None:
+                        # Baselined once, not on every reconnect: n_tup_del is
+                        # cumulative on the database side and outlives the
+                        # handle, so re-reading it here would silently discard
+                        # whatever batches a failed round committed before it
+                        # raised.
+                        prev_deleted = deleted_so_far(sys_db)
                 # Timed from here so the round time stays the sweep, not a
                 # reconnect an earlier failure forced.
                 start = time.monotonic()
                 # Relative to now, not to the grid: a round that started late
                 # still collects everything that has aged out by the time it
                 # runs, rather than leaving the overrun to the next round.
-                cutoff_ms = int((time.time() - window_s) * 1000)
+                cutoff_ms = int((time.time() - retention_s) * 1000)
                 sys_db.garbage_collect(
                     cutoff_epoch_timestamp_ms=cutoff_ms,
                     rows_threshold=None,
@@ -580,6 +599,7 @@ def run_multiprocess(
     drain_timeout: float,
     sample_rate: float,
     gc_minutes: float,
+    gc_interval: float,
 ) -> None:
     asyncio.run(recreate_database())
 
@@ -626,6 +646,7 @@ def run_multiprocess(
             target=gc_entry,
             args=(
                 gc_minutes,
+                gc_interval,
                 pool_size,
                 ready_barrier,
                 shutdown_event,
@@ -723,7 +744,7 @@ def run_multiprocess(
     print(f"Exec threads/wkr: {executor_threads}")
     if gc_enabled:
         print(
-            f"GC:               every {gc_minutes:g} min, "
+            f"GC:               every {gc_interval:g} min, "
             f"older than {gc_minutes:g} min  (1 process)"
         )
     else:
@@ -771,8 +792,8 @@ def run_multiprocess(
             print("GC rounds:        0   (every attempt failed)")
         else:
             print(
-                f"GC rounds:        0   (the run ended inside the first "
-                f"{gc_minutes:g}-minute window)"
+                f"GC rounds:        0   (the run ended before the first round, "
+                f"{gc_interval:g} min in)"
             )
         if gc_result["failures"]:
             print(
@@ -865,13 +886,29 @@ def main() -> None:
         type=float,
         default=0.0,
         dest="gc_minutes",
-        help="Every N minutes, garbage-collect workflows older than N minutes, "
-        "from one dedicated process for the whole run (0 = no GC). Only finished "
+        help="Garbage-collect workflows older than this many minutes, from one "
+        "dedicated process for the whole run (0 = no GC). Only finished "
         "workflows are eligible, so nothing the run still has to drain is ever "
-        "collected. Keep N well under --duration or the run ends before the "
-        "first round: at 30 a 5-minute run never sweeps at all",
+        "collected. Keep it well under --duration, or nothing is ever old "
+        "enough to sweep",
+    )
+    parser.add_argument(
+        "--gc-interval",
+        type=float,
+        default=None,
+        help="Minutes between GC rounds (default: the --gc retention, so each "
+        "round clears exactly one window). Shorter splits a window across "
+        "several rounds, longer hands each round more than a window. No effect "
+        "without --gc",
     )
     args = parser.parse_args()
+    # Defaulting here rather than in argparse keeps the default tied to --gc
+    # whatever it is set to, instead of freezing a number in the help text.
+    gc_interval = args.gc_interval if args.gc_interval is not None else args.gc_minutes
+    if args.gc_minutes > 0 and gc_interval <= 0:
+        # A non-positive period puts every grid slot in the past, which is a
+        # spin loop against the database rather than a fast collector.
+        parser.error("--gc-interval must be greater than 0")
     run_multiprocess(
         args.rps,
         args.duration,
@@ -886,6 +923,7 @@ def main() -> None:
         args.drain_timeout,
         args.sample_rate,
         args.gc_minutes,
+        gc_interval,
     )
 
 

@@ -34,6 +34,7 @@ import os
 import random
 import time
 import uuid
+from typing import Optional, Union
 from urllib.parse import urlparse
 
 import asyncpg
@@ -118,6 +119,7 @@ def worker_entry(
     pool_size: int,
     executor_threads: int,
     num_steps: int,
+    output_payload: Optional[bytes],
     ready_barrier,
     shutdown_event,
 ) -> None:
@@ -125,22 +127,22 @@ def worker_entry(
     # All DBOS code lives inside the worker process.
     from dbos import DBOS, DBOSConfig
 
-    # Returns a constant and touches nothing: the cost being measured is the
-    # operation_outputs row DBOS checkpoints per call, not the step body.
+    # Returns the same buffer on every call, never a fresh one: what is being
+    # measured is serializing and writing the bytes, not producing them.
     @DBOS.step()
-    async def noop_step() -> int:
-        return 0
+    async def noop_step() -> Union[int, bytes]:
+        return 0 if output_payload is None else output_payload
 
     # The explicit name is the contract with the enqueuers, which have no
     # handle on this function and pass its name as a string.
     @DBOS.workflow(name=WORKFLOW_NAME)
-    async def noop_workflow() -> int:
+    async def noop_workflow() -> Union[int, bytes]:
         # Sequential, not gathered: each step is a separate checkpoint write,
         # and running them one after another is what makes --steps a
         # multiplier on the system-database writes per workflow.
         for _ in range(num_steps):
             await noop_step()
-        return 1
+        return 1 if output_payload is None else output_payload
 
     config: DBOSConfig = {
         "name": APP_NAME,
@@ -501,6 +503,7 @@ def run_multiprocess(
     num_enqueuers: int,
     worker_concurrency: int,
     num_steps: int,
+    output_kb: int,
     drain_timeout: float,
     sample_rate: float,
     gc_minutes: float,
@@ -514,6 +517,12 @@ def run_multiprocess(
     base, extra = divmod(total_enqueues, num_enqueuers)
     enqueue_counts = [base + (1 if i < extra else 0) for i in range(num_enqueuers)]
     per_proc_rps = total_rps / num_enqueuers
+
+    # One buffer for the whole run, generated here and inherited by every
+    # worker, so no call ever pays to produce its own return value. urandom
+    # rather than a repeated byte because the outputs land in a TOASTable
+    # column: compressible filler would store smaller than the size asked for.
+    output_payload = os.urandom(output_kb * 1024) if output_kb > 0 else None
 
     ctx = mp.get_context("spawn")
 
@@ -560,6 +569,7 @@ def run_multiprocess(
                 pool_size,
                 executor_threads,
                 num_steps,
+                output_payload,
                 ready_barrier,
                 shutdown_event,
             ),
@@ -626,6 +636,13 @@ def run_multiprocess(
     print(f"Queue:            {QUEUE_NAME}  (database-backed)")
     print(f"Worker concurr.:  {worker_concurrency}  (per worker process)")
     print(f"Steps/workflow:   {num_steps}")
+    if output_kb > 0:
+        print(
+            f"Output size:      {output_kb} KB   "
+            f"(workflow and every step, {(num_steps + 1) * output_kb} KB/workflow)"
+        )
+    else:
+        print("Output size:      0   (int returns)")
     print(f"Target RPS:       {total_rps}  ({per_proc_rps:.1f}/enqueuer)")
     print(f"Planned enqueues: {total_enqueues}")
     print(f"Max in-flight:    {max_inflight}  (per enqueuer)")
@@ -736,9 +753,19 @@ def main() -> None:
         type=int,
         default=0,
         dest="num_steps",
-        help="Number of steps each workflow runs (default 0). Each step returns "
-        "a constant, so this scales the checkpoint rows written per workflow "
-        "without adding work of its own",
+        help="Number of steps each workflow runs (default 0). A step does no "
+        "work of its own, so this scales the checkpoint rows written per "
+        "workflow; --output-size sets how large each of those rows is",
+    )
+    parser.add_argument(
+        "--output-size",
+        type=int,
+        default=0,
+        dest="output_kb",
+        help="Kilobytes of random data returned by the workflow and by each of "
+        "its steps (default 0 = return an int, as before). The buffer is "
+        "generated once for the whole run and shared, so this costs writes, not "
+        "CPU. Combines with --steps: N steps store (N+1) x this per workflow",
     )
     parser.add_argument(
         "--drain-timeout",
@@ -774,6 +801,7 @@ def main() -> None:
         args.enqueuers,
         args.worker_concurrency,
         args.num_steps,
+        args.output_kb,
         args.drain_timeout,
         args.sample_rate,
         args.gc_minutes,

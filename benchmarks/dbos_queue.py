@@ -117,6 +117,7 @@ def bootstrap_entry(worker_concurrency: int) -> None:
 def worker_entry(
     pool_size: int,
     executor_threads: int,
+    num_steps: int,
     ready_barrier,
     shutdown_event,
 ) -> None:
@@ -124,10 +125,21 @@ def worker_entry(
     # All DBOS code lives inside the worker process.
     from dbos import DBOS, DBOSConfig
 
+    # Returns a constant and touches nothing: the cost being measured is the
+    # operation_outputs row DBOS checkpoints per call, not the step body.
+    @DBOS.step()
+    async def noop_step() -> int:
+        return 0
+
     # The explicit name is the contract with the enqueuers, which have no
     # handle on this function and pass its name as a string.
     @DBOS.workflow(name=WORKFLOW_NAME)
     async def noop_workflow() -> int:
+        # Sequential, not gathered: each step is a separate checkpoint write,
+        # and running them one after another is what makes --steps a
+        # multiplier on the system-database writes per workflow.
+        for _ in range(num_steps):
+            await noop_step()
         return 1
 
     config: DBOSConfig = {
@@ -488,6 +500,7 @@ def run_multiprocess(
     num_workers: int,
     num_enqueuers: int,
     worker_concurrency: int,
+    num_steps: int,
     drain_timeout: float,
     sample_rate: float,
     gc_minutes: float,
@@ -543,7 +556,13 @@ def run_multiprocess(
     for _ in range(num_workers):
         p = ctx.Process(
             target=worker_entry,
-            args=(pool_size, executor_threads, ready_barrier, shutdown_event),
+            args=(
+                pool_size,
+                executor_threads,
+                num_steps,
+                ready_barrier,
+                shutdown_event,
+            ),
         )
         p.start()
         workers.append(p)
@@ -606,6 +625,7 @@ def run_multiprocess(
     print(f"Enqueuers:        {num_enqueuers}   (client, enqueue only)")
     print(f"Queue:            {QUEUE_NAME}  (database-backed)")
     print(f"Worker concurr.:  {worker_concurrency}  (per worker process)")
+    print(f"Steps/workflow:   {num_steps}")
     print(f"Target RPS:       {total_rps}  ({per_proc_rps:.1f}/enqueuer)")
     print(f"Planned enqueues: {total_enqueues}")
     print(f"Max in-flight:    {max_inflight}  (per enqueuer)")
@@ -712,6 +732,15 @@ def main() -> None:
         help="Max concurrent workflows from the queue per worker process",
     )
     parser.add_argument(
+        "--steps",
+        type=int,
+        default=0,
+        dest="num_steps",
+        help="Number of steps each workflow runs (default 0). Each step returns "
+        "a constant, so this scales the checkpoint rows written per workflow "
+        "without adding work of its own",
+    )
+    parser.add_argument(
         "--drain-timeout",
         type=float,
         default=0.0,
@@ -744,6 +773,7 @@ def main() -> None:
         args.workers,
         args.enqueuers,
         args.worker_concurrency,
+        args.num_steps,
         args.drain_timeout,
         args.sample_rate,
         args.gc_minutes,

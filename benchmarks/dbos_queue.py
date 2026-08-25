@@ -151,6 +151,7 @@ def worker_entry(
         "sys_db_pool_size": pool_size,
         "max_executor_threads": executor_threads,
         "executor_id": str(uuid.uuid7()),
+        "conductor_key": os.environ.get("DBOS_CONDUCTOR_KEY"),
     }
     DBOS(config=config)
     # No listen_queues: without a filter, every worker polls every queue this

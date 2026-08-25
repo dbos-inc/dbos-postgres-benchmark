@@ -517,7 +517,7 @@ def main() -> None:
     parser.add_argument(
         "--pool-size",
         type=int,
-        default=3,
+        default=5,
         help="System DB pool size per process (workers and enqueuers alike)",
     )
     parser.add_argument(

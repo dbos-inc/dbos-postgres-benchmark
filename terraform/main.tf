@@ -21,8 +21,9 @@ resource "random_password" "db" {
 }
 
 locals {
-  db_username = "postgres"
-  db_password = random_password.db.result
+  db_username   = "postgres"
+  db_password   = random_password.db.result
+  db_identifier = "dbos-bench-postgres"
 }
 
 # --- Variables ---
@@ -75,17 +76,163 @@ resource "aws_security_group" "rds" {
   tags = { Name = "dbos-bench-rds-sg" }
 }
 
-# --- RDS (db.m7i.24xlarge) ---
+# --- CloudWatch log groups for the RDS log exports ---
+#
+# RDS creates these implicitly on first export, but AWS-created groups are not
+# in Terraform state, never expire, and survive `terraform destroy` -- so the
+# exported logs would outlive the cluster and keep billing. Declaring them here
+# puts them under Terraform's lifecycle: destroy deletes them and their data.
+#
+# NOT declared here: the RDSOSMetrics log group that Enhanced Monitoring writes
+# to. It is account-wide and shared by every RDS instance, so managing it here
+# would make `terraform destroy` delete other instances' monitoring data. It
+# already carries a 30-day retention, so its data ages out on its own.
+
+resource "aws_cloudwatch_log_group" "rds_postgresql" {
+  name              = "/aws/rds/instance/${local.db_identifier}/postgresql"
+  retention_in_days = 7
+}
+
+resource "aws_cloudwatch_log_group" "rds_upgrade" {
+  name              = "/aws/rds/instance/${local.db_identifier}/upgrade"
+  retention_in_days = 7
+}
+
+# --- Enhanced Monitoring IAM role ---
+
+data "aws_iam_policy_document" "rds_monitoring_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["monitoring.rds.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "rds_monitoring" {
+  name_prefix        = "dbos-bench-rds-monitoring-"
+  assume_role_policy = data.aws_iam_policy_document.rds_monitoring_assume.json
+}
+
+resource "aws_iam_role_policy_attachment" "rds_monitoring" {
+  role       = aws_iam_role.rds_monitoring.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+}
+
+# --- Parameter group: pin the observability counters on ---
+#
+# Most of these already match the postgres18 defaults; they are pinned
+# explicitly so a future default change cannot silently turn them off.
+# Deliberately NOT set: log_min_duration_statement and auto_explain. Logging
+# every statement at benchmark rates distorts the very throughput being
+# measured. Turn them on ad hoc when debugging a specific query, not for a run.
+
+resource "aws_db_parameter_group" "postgres" {
+  name_prefix = "dbos-bench-pg18-"
+  family      = "postgres18"
+
+  # --- Static: require a reboot, applied at create time ---
+  parameter {
+    name         = "shared_preload_libraries"
+    value        = "pg_stat_statements,pg_tle"
+    apply_method = "pending-reboot"
+  }
+  parameter {
+    name         = "pg_stat_statements.max"
+    value        = "10000"
+    apply_method = "pending-reboot"
+  }
+  # Full statement text in Performance Insights rather than a 4KB truncation.
+  parameter {
+    name         = "track_activity_query_size"
+    value        = "16384"
+    apply_method = "pending-reboot"
+  }
+
+  # --- Dynamic ---
+  # Block read/write timings, so PI attributes waits to actual IO.
+  parameter {
+    name  = "track_io_timing"
+    value = "1"
+  }
+  parameter {
+    name  = "track_wal_io_timing"
+    value = "1"
+  }
+  parameter {
+    name  = "track_functions"
+    value = "all"
+  }
+  # Always compute query IDs so pg_stat_statements and PI agree on identity.
+  parameter {
+    name  = "compute_query_id"
+    value = "on"
+  }
+  # ALL also counts statements nested inside functions and procedures.
+  parameter {
+    name  = "pg_stat_statements.track"
+    value = "ALL"
+  }
+  # The one observability knob deliberately left OFF. Upstream Postgres warns
+  # that track_planning causes a noticeable penalty when many concurrent
+  # connections execute statements with identical structure, because they
+  # contend on the same pg_stat_statements entry. That is precisely this
+  # benchmark's workload, so enabling it would distort the throughput being
+  # measured. Set to 1 only when investigating planning time specifically.
+  parameter {
+    name  = "pg_stat_statements.track_planning"
+    value = "0"
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+# --- RDS (db.m7i.24xlarge) --- (original, high-end config)
+#
+# resource "aws_db_instance" "postgres" {
+#   identifier     = "dbos-bench-postgres"
+#   engine         = "postgres"
+#   engine_version = "18"
+#
+#   instance_class          = "db.m7i.24xlarge"
+#   allocated_storage       = 300
+#   storage_type            = "io2"
+#   iops                    = 120000
+#   db_name                 = "postgres"
+#   username                = local.db_username
+#   password                = local.db_password
+#   port                    = 5432
+#   availability_zone       = "${var.aws_region}a"
+#   publicly_accessible     = false
+#   skip_final_snapshot     = true
+#   backup_retention_period = 0
+#   apply_immediately       = true
+#   vpc_security_group_ids  = [aws_security_group.rds.id]
+#
+#   tags = { Name = "dbos-bench-postgres" }
+# }
+
+# --- RDS (db.m7i.4xlarge) ---
 
 resource "aws_db_instance" "postgres" {
-  identifier     = "dbos-bench-postgres"
+  identifier     = local.db_identifier
   engine         = "postgres"
   engine_version = "18"
 
-  instance_class          = "db.m7i.24xlarge"
-  allocated_storage       = 300
-  storage_type            = "io2"
-  iops                    = 120000
+  # Create the log groups first so RDS adopts the retention-bounded, Terraform-
+  # managed groups instead of implicitly creating never-expiring ones.
+  depends_on = [
+    aws_cloudwatch_log_group.rds_postgresql,
+    aws_cloudwatch_log_group.rds_upgrade,
+  ]
+
+  instance_class          = "db.m7i.4xlarge"
+  allocated_storage       = 400
+  storage_type            = "gp3"
+  storage_encrypted       = true
   db_name                 = "postgres"
   username                = local.db_username
   password                = local.db_password
@@ -96,6 +243,20 @@ resource "aws_db_instance" "postgres" {
   backup_retention_period = 0
   apply_immediately       = true
   vpc_security_group_ids  = [aws_security_group.rds.id]
+  parameter_group_name    = aws_db_parameter_group.postgres.name
+
+  # Performance Insights: 7-day retention is the free tier. Longer retention is
+  # billed per vCPU, and a benchmark never needs more than the current run.
+  performance_insights_enabled          = true
+  performance_insights_retention_period = 7
+
+  # Enhanced Monitoring at 1s. OS-level CPU/IO/memory sampled per second, which
+  # is the granularity a benchmark run actually needs; metrics are delivered to
+  # CloudWatch Logs and billed at ingestion rates, so this scales with run time.
+  monitoring_interval = 1
+  monitoring_role_arn = aws_iam_role.rds_monitoring.arn
+
+  enabled_cloudwatch_logs_exports = ["postgresql", "upgrade"]
 
   tags = { Name = "dbos-bench-postgres" }
 }

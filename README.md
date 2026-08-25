@@ -35,7 +35,7 @@ uv run python benchmarks/dbos_start_workflow.py --rps 1000 --duration 900
 ### DBOS queue throughput
 
 ```bash
-uv run python benchmarks/dbos_queue.py --rps 1000 --duration 900
+uv run python benchmarks/dbos_queue.py --rps 1000 --duration 900 --workers 8 --enqueuers 64
 ```
 
 ### DBOS partitioned queue throughput

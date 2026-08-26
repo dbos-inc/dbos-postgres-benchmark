@@ -665,6 +665,11 @@ def progress_monitor(
         if shutdown_event.is_set():
             break
         now = time.monotonic()
+        # Wall clock read beside the monotonic one, so the stamp names the end
+        # of the window this line reports -- the point to line a dip up against
+        # in the Postgres log or a metrics dashboard. Durations stay on the
+        # monotonic clock, which no time adjustment can step.
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         # Completions first: neither array is read as an atomic snapshot, and
         # this order puts the skew where it cannot invert the subtraction --
         # completed is read no later than enqueued, so backlog stays >= 0.
@@ -682,7 +687,8 @@ def progress_monitor(
         cum_completion_rps = completed / elapsed if elapsed > 0 else 0.0
         minutes, seconds = divmod(int(round(elapsed)), 60)
         print(
-            f"[progress] t={minutes:02d}:{seconds:02d}  window={window:.1f}s  "
+            f"[progress] {stamp}  t={minutes:02d}:{seconds:02d}  "
+            f"window={window:.1f}s  "
             f"enq {window_enqueued} ({enqueue_rps:.0f}/s)  "
             f"done {window_completed} ({completion_rps:.0f}/s)  "
             f"backlog {enqueued - completed}  "

@@ -27,13 +27,23 @@ say whether the collector keeps up. Setting the interval apart from the
 retention separates the two questions -- how much backlog a sweep clears, and
 how often it is asked to. Enqueue and completion throughput are then measured
 while it deletes underneath them.
+
+``--progress-interval N`` prints a throughput line every N minutes (5 by
+default), covering the interval just ended: workflows enqueued, workflows
+completed, and the backlog between the two. Both counts are kept in process --
+one shared-memory slot per enqueuer and per worker -- rather than queried,
+because a filtered count over ``workflow_status`` would scan the table the
+benchmark is stressing and, under ``--gc``, would miss whatever the collector
+had already swept.
 """
 
 import argparse
 import asyncio
+import ctypes
 import multiprocessing as mp
 import os
 import random
+import threading
 import time
 import uuid
 from typing import Optional, Union
@@ -118,16 +128,25 @@ def bootstrap_entry(worker_concurrency: int) -> None:
 
 
 def worker_entry(
+    worker_id: int,
     pool_size: int,
     executor_threads: int,
     num_steps: int,
     output_payload: Optional[bytes],
+    completed_totals,
     ready_barrier,
     shutdown_event,
 ) -> None:
     """Launch the DBOS runtime and execute dequeued workflows. Enqueues nothing."""
     # All DBOS code lives inside the worker process.
     from dbos import DBOS, DBOSConfig
+
+    # Progress reporting publishes into this worker's own slot, so the write
+    # never contends with another process. The lock is process-local and only
+    # orders this worker's executor threads against one another; a workflow
+    # already costs several system-database round trips, so an uncontended
+    # acquire is not measurable beside it.
+    count_lock = threading.Lock()
 
     # Returns the same buffer on every call, never a fresh one: what is being
     # measured is serializing and writing the bytes, not producing them.
@@ -144,6 +163,13 @@ def worker_entry(
         # multiplier on the system-database writes per workflow.
         for _ in range(num_steps):
             await noop_step()
+        # Counted where the body finishes rather than where DBOS commits the
+        # SUCCESS checkpoint a moment later: the rate is the same either way,
+        # and only the reported backlog is affected, understated by however
+        # many final checkpoint writes are in flight.
+        if completed_totals is not None:
+            with count_lock:
+                completed_totals[worker_id] += 1
         return 1 if output_payload is None else output_payload
 
     config: DBOSConfig = {
@@ -385,6 +411,7 @@ def enqueuer_entry(
     pool_size: int,
     drain_timeout: float,
     sample_rate: float,
+    enqueued_totals,
     ready_barrier,
     enqueue_done_barrier,
     done_barrier,
@@ -443,6 +470,12 @@ def enqueuer_entry(
                 }
                 handle = await client.enqueue_async(options)
                 enqueued += 1
+                if enqueued_totals is not None:
+                    # A store of the local total, not a read-modify-write on
+                    # shared memory: this coroutine is the slot's only writer
+                    # and the event loop runs it single-threaded, so the store
+                    # needs no lock.
+                    enqueued_totals[enqueuer_id] = enqueued
                 if sampled:
                     samples.append((handle.get_workflow_id(), start))
             except Exception:
@@ -585,6 +618,83 @@ def enqueuer_entry(
         client.destroy()
 
 
+def progress_monitor(
+    interval_s: float,
+    enqueued_totals,
+    completed_totals,
+    ready_barrier,
+    shutdown_event,
+) -> None:
+    """Print one throughput line per interval, covering the interval just ended.
+
+    Runs as a thread in the parent, which imports no DBOS code and holds no
+    database connection, so reporting costs the run nothing beyond summing two
+    small arrays.
+
+    Throughput is counted at the source rather than queried: enqueuers publish
+    how many workflows they have written, workers how many they have executed,
+    each into its own shared-memory slot. Counting in the database instead would
+    mean a filtered count over ``workflow_status`` -- a scan of the very table
+    the benchmark is stressing, growing more expensive the longer the run goes --
+    and under ``--gc`` it would silently miss every finished workflow the
+    collector had already swept.
+
+    Both rates are reported, plus the backlog that separates them, because
+    either rate alone is ambiguous. A backlog flat near zero means completions
+    are only tracking the offered rate, so the number describes the load
+    generator; a growing backlog means the completion rate is the system's
+    capacity.
+    """
+    # Joins the barrier as one more party, so the grid is anchored at the
+    # instant the run starts rather than at process spawn.
+    ready_barrier.wait()
+    grid_start = time.monotonic()
+    prev_time = grid_start
+    prev_enqueued = 0
+    prev_completed = 0
+    slot = 0
+    while True:
+        slot += 1
+        # A fixed grid anchored at the barrier, like the GC loop: a report that
+        # wakes late does not push the ones after it back.
+        wait = grid_start + slot * interval_s - time.monotonic()
+        # Waiting on the event rather than sleeping ends the reports when the
+        # drain does, instead of up to one interval later.
+        if wait > 0:
+            shutdown_event.wait(wait)
+        if shutdown_event.is_set():
+            break
+        now = time.monotonic()
+        # Completions first: neither array is read as an atomic snapshot, and
+        # this order puts the skew where it cannot invert the subtraction --
+        # completed is read no later than enqueued, so backlog stays >= 0.
+        completed = sum(completed_totals)
+        enqueued = sum(enqueued_totals)
+        window = now - prev_time
+        elapsed = now - grid_start
+        window_enqueued = enqueued - prev_enqueued
+        window_completed = completed - prev_completed
+        # Divided by the interval actually measured rather than the nominal one,
+        # so a late wake reports the rate it saw instead of an inflated one.
+        enqueue_rps = window_enqueued / window if window > 0 else 0.0
+        completion_rps = window_completed / window if window > 0 else 0.0
+        cum_enqueue_rps = enqueued / elapsed if elapsed > 0 else 0.0
+        cum_completion_rps = completed / elapsed if elapsed > 0 else 0.0
+        minutes, seconds = divmod(int(round(elapsed)), 60)
+        print(
+            f"[progress] t={minutes:02d}:{seconds:02d}  window={window:.1f}s  "
+            f"enq {window_enqueued} ({enqueue_rps:.0f}/s)  "
+            f"done {window_completed} ({completion_rps:.0f}/s)  "
+            f"backlog {enqueued - completed}  "
+            f"cum: enq {enqueued} ({cum_enqueue_rps:.0f}/s) "
+            f"done {completed} ({cum_completion_rps:.0f}/s)",
+            flush=True,
+        )
+        prev_time = now
+        prev_enqueued = enqueued
+        prev_completed = completed
+
+
 def run_multiprocess(
     total_rps: int,
     duration_s: float,
@@ -600,6 +710,7 @@ def run_multiprocess(
     sample_rate: float,
     gc_minutes: float,
     gc_interval: float,
+    progress_interval: float,
 ) -> None:
     asyncio.run(recreate_database())
 
@@ -633,12 +744,48 @@ def run_multiprocess(
     result_queue: mp.Queue = ctx.Queue()
     gc_result_queue: mp.Queue = ctx.Queue()
     gc_enabled = gc_minutes > 0
-    # Both pools and the collector sync on ready; the phase barriers are
-    # enqueuer-only.
-    ready_barrier = ctx.Barrier(num_workers + num_enqueuers + (1 if gc_enabled else 0))
+    progress_enabled = progress_interval > 0
+    # One slot per process, so publishing a count never contends across
+    # processes and the parent's read is a plain sum. lock=False because no slot
+    # has two writers: an enqueuer's event loop is single-threaded, and a
+    # worker's executor threads are ordered by a lock inside that process.
+    enqueued_totals = (
+        ctx.Array(ctypes.c_int64, num_enqueuers, lock=False)
+        if progress_enabled
+        else None
+    )
+    completed_totals = (
+        ctx.Array(ctypes.c_int64, num_workers, lock=False) if progress_enabled else None
+    )
+    # Both pools, the collector and the progress monitor sync on ready; the
+    # phase barriers are enqueuer-only.
+    ready_barrier = ctx.Barrier(
+        num_workers
+        + num_enqueuers
+        + (1 if gc_enabled else 0)
+        + (1 if progress_enabled else 0)
+    )
     enqueue_done_barrier = ctx.Barrier(num_enqueuers)
     done_barrier = ctx.Barrier(num_enqueuers)
     shutdown_event = ctx.Event()
+
+    if progress_enabled:
+        # A thread, not a process: the counters are already shared memory and
+        # the parent has nothing else to do while it waits on results. Daemon,
+        # because it is a party on the ready barrier -- a run that dies before
+        # every process reaches that barrier would otherwise leave it blocked
+        # there holding up the parent's exit.
+        threading.Thread(
+            target=progress_monitor,
+            args=(
+                progress_interval * 60.0,
+                enqueued_totals,
+                completed_totals,
+                ready_barrier,
+                shutdown_event,
+            ),
+            daemon=True,
+        ).start()
 
     gc_proc = None
     if gc_enabled:
@@ -656,14 +803,16 @@ def run_multiprocess(
         gc_proc.start()
 
     workers = []
-    for _ in range(num_workers):
+    for worker_id in range(num_workers):
         p = ctx.Process(
             target=worker_entry,
             args=(
+                worker_id,
                 pool_size,
                 executor_threads,
                 num_steps,
                 output_payload,
+                completed_totals,
                 ready_barrier,
                 shutdown_event,
             ),
@@ -684,6 +833,7 @@ def run_multiprocess(
                 pool_size,
                 drain_timeout,
                 sample_rate,
+                enqueued_totals,
                 ready_barrier,
                 enqueue_done_barrier,
                 done_barrier,
@@ -749,6 +899,10 @@ def run_multiprocess(
         )
     else:
         print("GC:               off")
+    if progress_enabled:
+        print(f"Progress:         every {progress_interval:g} min")
+    else:
+        print("Progress:         off")
     print(f"Enqueue time:     {enqueue_time:.2f}s")
     print(f"Drain time:       {drain_time:.2f}s")
     print(f"Total time:       {total_time:.2f}s")
@@ -882,6 +1036,16 @@ def main() -> None:
         help="Fraction of workflows sampled for latency measurement (default 0.01)",
     )
     parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=5.0,
+        help="Minutes between progress reports, each covering the interval just "
+        "ended: workflows enqueued, workflows completed and the backlog between "
+        "them (0 = no reports). Reports start with the enqueue phase and "
+        "continue through the drain, where the enqueue rate falls to zero and "
+        "the completion rate shows how fast the backlog clears",
+    )
+    parser.add_argument(
         "--gc",
         type=float,
         default=0.0,
@@ -924,6 +1088,7 @@ def main() -> None:
         args.sample_rate,
         args.gc_minutes,
         gc_interval,
+        args.progress_interval,
     )
 
 

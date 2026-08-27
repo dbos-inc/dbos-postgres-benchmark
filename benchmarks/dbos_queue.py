@@ -457,6 +457,7 @@ def _install_gc_instrumentation() -> None:
     from dbos._schemas.system_database import SystemSchema
     from dbos._sys_db import SystemDatabase, WorkflowStatusString
     from sqlalchemy.exc import DBAPIError
+    from sqlalchemy.ext.compiler import compiles
 
     if os.environ.get("GC_TRACE", "1") == "0":
         return
@@ -545,32 +546,48 @@ def _install_gc_instrumentation() -> None:
         trace.record(phase, time.perf_counter() - t0, len(rows))
         return rows
 
+    class _Explain(sa.sql.expression.Executable, sa.sql.expression.ClauseElement):
+        """EXPLAIN compiled through SQLAlchemy rather than concatenated onto a
+        stringified statement.
+
+        Going through the normal execution path is what makes the engine apply
+        its schema translate map and bind its parameters, exactly as it does
+        for the statement being explained. Building the text by hand leaves the
+        placeholder schema unresolved and the EXPLAIN fails to parse.
+        """
+
+        inherit_cache = False
+
+        def __init__(self, stmt) -> None:
+            self.stmt = stmt
+
+    @compiles(_Explain)
+    def _compile_explain(element, compiler, **kw) -> str:
+        return "EXPLAIN (ANALYZE, BUFFERS) " + compiler.process(element.stmt, **kw)
+
     def _explain(c, label, stmt) -> None:
         """EXPLAIN (ANALYZE, BUFFERS) one SELECT, on the connection that is
-        about to run it so it sees the same snapshot. Best effort: a compile
-        that goes wrong costs the plan, not the round."""
+        about to run it so it sees the same snapshot.
+
+        Only ever called on the two SELECTs. EXPLAIN ANALYZE executes what it
+        explains, so pointing it at either DELETE would delete.
+        """
+        # In a savepoint, because a failed EXPLAIN aborts the transaction and
+        # the round is about to run its real statements on this same one.
+        nested = c.begin_nested()
         try:
-            sql = str(
-                stmt.compile(
-                    dialect=c.dialect,
-                    # The tables carry a placeholder schema that only the
-                    # engine's execution options resolve, so compiling without
-                    # the map would emit a schema that does not exist.
-                    schema_translate_map=c.get_execution_options().get(
-                        "schema_translate_map"
-                    ),
-                    compile_kwargs={"literal_binds": True},
-                )
-            )
-            plan = c.exec_driver_sql("EXPLAIN (ANALYZE, BUFFERS) " + sql).fetchall()
-            print(f"[gc-trace] round {trace.round} EXPLAIN {label}:", flush=True)
-            for row in plan:
-                print(f"[gc-trace]   {row[0]}", flush=True)
+            plan = c.execute(_Explain(stmt)).fetchall()
+            nested.commit()
         except Exception as e:
+            nested.rollback()
             print(
                 f"[gc-trace] EXPLAIN {label} failed: {type(e).__name__}: {e}",
                 flush=True,
             )
+            return
+        print(f"[gc-trace] round {trace.round} EXPLAIN {label}:", flush=True)
+        for row in plan:
+            print(f"[gc-trace]   {row[0]}", flush=True)
 
     def _instrumented_garbage_collect(
         self,

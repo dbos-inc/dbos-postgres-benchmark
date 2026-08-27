@@ -225,9 +225,12 @@ def worker_entry(
 #   GC_TRACE_EXPLAIN=0       EXPLAIN (ANALYZE, BUFFERS) the batch probe and the
 #                            trailing scan, once per round. Off by default: it
 #                            re-runs the statement it explains, and for the
-#                            trailing scan that can double the round. Only the
-#                            two SELECTs are ever explained -- EXPLAIN ANALYZE
-#                            on a DELETE would delete.
+#                            trailing scan that can double the round.
+#
+# The round's first batch delete is always explained, for its per-constraint
+# trigger times -- how much of a delete goes to the five ON DELETE CASCADE
+# foreign keys pointing at workflow_status. No switch, because it costs one
+# extra batch out of a round's several hundred; GC_TRACE=0 turns off the lot.
 #   GC_TRACE_CSV=<path>      Append one line per SQL statement executed.
 # ===========================================================================
 
@@ -452,6 +455,7 @@ def _install_gc_instrumentation() -> None:
     import functools
     import hashlib
     import inspect
+    import re
 
     import sqlalchemy as sa
     from dbos._schemas.system_database import SystemSchema
@@ -565,19 +569,29 @@ def _install_gc_instrumentation() -> None:
     def _compile_explain(element, compiler, **kw) -> str:
         return "EXPLAIN (ANALYZE, BUFFERS) " + compiler.process(element.stmt, **kw)
 
-    def _explain(c, label, stmt) -> None:
-        """EXPLAIN (ANALYZE, BUFFERS) one SELECT, on the connection that is
+    # "Trigger for constraint x on y: time=1.234 calls=5678", one line per
+    # constraint fired, which for a delete is the cascade cost being hunted.
+    _TRIGGER_RE = re.compile(r"^Trigger .*: time=([0-9.]+) calls=([0-9]+)")
+    _EXEC_TIME_RE = re.compile(r"^Execution Time: ([0-9.]+) ms")
+
+    def _explain(c, label, stmt, rollback: bool = False) -> None:
+        """EXPLAIN (ANALYZE, BUFFERS) one statement, on the connection that is
         about to run it so it sees the same snapshot.
 
-        Only ever called on the two SELECTs. EXPLAIN ANALYZE executes what it
-        explains, so pointing it at either DELETE would delete.
+        EXPLAIN ANALYZE executes what it explains, so a DELETE passed here must
+        set rollback=True. The savepoint is then undone and the caller's own
+        DELETE does the real work, which keeps its rowcount exact and costs one
+        extra batch delete per round. The savepoint also contains a failed
+        EXPLAIN, which would otherwise abort the transaction the round is about
+        to run its real statements on.
         """
-        # In a savepoint, because a failed EXPLAIN aborts the transaction and
-        # the round is about to run its real statements on this same one.
         nested = c.begin_nested()
         try:
             plan = c.execute(_Explain(stmt)).fetchall()
-            nested.commit()
+            if rollback:
+                nested.rollback()
+            else:
+                nested.commit()
         except Exception as e:
             nested.rollback()
             print(
@@ -586,8 +600,28 @@ def _install_gc_instrumentation() -> None:
             )
             return
         print(f"[gc-trace] round {trace.round} EXPLAIN {label}:", flush=True)
+        trigger_ms, triggers, exec_ms = 0.0, 0, None
         for row in plan:
             print(f"[gc-trace]   {row[0]}", flush=True)
+            m = _TRIGGER_RE.match(row[0])
+            if m:
+                trigger_ms += float(m.group(1))
+                triggers += 1
+                continue
+            m = _EXEC_TIME_RE.match(row[0])
+            if m:
+                exec_ms = float(m.group(1))
+        # The headline for the delete: Execution Time includes trigger time, so
+        # this is the share of the statement spent in referential-integrity
+        # cascades rather than in deleting rows. Skipped when nothing fired.
+        if triggers:
+            share = f", {100.0 * trigger_ms / exec_ms:.1f}% of" if exec_ms else " of"
+            print(
+                f"[gc-trace]   -> {triggers} triggers: {trigger_ms:.1f}ms{share} "
+                f"{exec_ms if exec_ms is not None else float('nan'):.1f}ms "
+                f"execution time",
+                flush=True,
+            )
 
     def _instrumented_garbage_collect(
         self,
@@ -670,22 +704,24 @@ def _install_gc_instrumentation() -> None:
                         .limit(1)
                         .offset(batch_size - 1)
                     )
-                    if trace.explain and not explained:
-                        explained = True
+                    # Both explains land on the round's first batch, so a
+                    # round costs at most one of each.
+                    first = not explained
+                    explained = True
+                    if first and trace.explain:
                         _explain(c, "batch_probe", probe)
                     step = _timed_scalar("batch_probe", c, probe)
                     if step is None:
                         _timed_dml("final_delete", c, sa.delete(ws).where(gc_filter))
                         return None
-                    _timed_dml(
-                        "batch_delete",
-                        c,
-                        sa.delete(ws).where(
-                            gc_filter,
-                            ws.c.created_at > watermark,
-                            ws.c.created_at <= step,
-                        ),
+                    delete = sa.delete(ws).where(
+                        gc_filter,
+                        ws.c.created_at > watermark,
+                        ws.c.created_at <= step,
                     )
+                    if first:
+                        _explain(c, "batch_delete", delete, rollback=True)
+                    _timed_dml("batch_delete", c, delete)
                     return step
 
             watermark = 0

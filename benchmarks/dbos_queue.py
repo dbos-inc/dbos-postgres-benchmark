@@ -222,10 +222,9 @@ def worker_entry(
 #   GC_TRACE_WATCHDOG=30     Seconds between "still running" lines (0 = none).
 #                            This is what makes a stalled round visible while
 #                            it is stalled rather than once it ends.
-#   GC_TRACE_EXPLAIN=0       EXPLAIN (ANALYZE, BUFFERS) the batch probe and the
-#                            trailing scan, once per round. Off by default: it
-#                            re-runs the statement it explains, and for the
-#                            trailing scan that can double the round.
+#   GC_TRACE_EXPLAIN=0       EXPLAIN (ANALYZE, BUFFERS) the batch probe, once
+#                            per round. Off by default: it re-runs the
+#                            statement it explains.
 #
 # The round's first batch delete is always explained, for its per-constraint
 # trigger times -- how much of a delete goes to the five ON DELETE CASCADE
@@ -234,13 +233,21 @@ def worker_entry(
 #   GC_TRACE_CSV=<path>      Append one line per SQL statement executed.
 # ===========================================================================
 
-# sha256 of inspect.getsource(SystemDatabase.garbage_collect) in dbos==2.32.0a3,
-# the implementation the reimplementation below was copied from. Checked at
-# install: a bump that rewrites the collector leaves this measuring SQL that is
-# no longer issued, and every conclusion drawn from it would be wrong. Warn
-# rather than raise, so a drifted version costs the run its instrumentation
-# instead of its garbage collection.
-_GC_SOURCE_SHA256 = "a6136081ed96fbee6ac96e0a151f37cb9e6398731ec523434b738aa10b1a908a"
+# The completed_at collector is installed unconditionally, whatever the
+# installed dbos ships -- that is the point: it lets the new algorithm be
+# measured against an SDK that does not have it yet.
+#
+# These hashes only name what was replaced, in the install line. An unknown
+# hash is not an error here; it just means the log cannot say which collector
+# went away.
+_GC_SOURCE_VARIANTS = {
+    "a6136081ed96fbee6ac96e0a151f37cb9e6398731ec523434b738aa10b1a908a": (
+        "the created_at collector"
+    ),
+    "3c890dd09f6d020afbf367bbba5e2cd1b5d8d0e0097db5b3aa0785231a2b070c": (
+        "the completed_at collector"
+    ),
+}
 
 
 def _fmt_dur(seconds: float) -> str:
@@ -260,11 +267,10 @@ class _GCTrace:
     PHASES = (
         "threshold_probe",  # rows_threshold cutoff lookup (unused at rows_threshold=None)
         "checkout",  # pool checkout + BEGIN
-        "batch_probe",  # SELECT created_at ... ORDER BY created_at LIMIT 1 OFFSET n-1
-        "batch_delete",  # DELETE of one batch
-        "final_delete",  # DELETE of everything still below the cutoff
+        "batch_probe",  # SELECT <key> ... ORDER BY <key> LIMIT 1 OFFSET n-1
+        "batch_delete",  # DELETE of one bounded batch
+        "final_delete",  # DELETE of the tail left after the last probe
         "commit",
-        "trailing_scan",  # SELECT workflow_uuid WHERE created_at < cutoff -- unbounded
     )
 
     def __init__(
@@ -459,7 +465,7 @@ def _install_gc_instrumentation() -> None:
 
     import sqlalchemy as sa
     from dbos._schemas.system_database import SystemSchema
-    from dbos._sys_db import SystemDatabase, WorkflowStatusString
+    from dbos._sys_db import SystemDatabase
     from sqlalchemy.exc import DBAPIError
     from sqlalchemy.ext.compiler import compiles
 
@@ -476,18 +482,16 @@ def _install_gc_instrumentation() -> None:
     digest = hashlib.sha256(
         inspect.getsource(SystemDatabase.garbage_collect).encode()
     ).hexdigest()
-    if digest != _GC_SOURCE_SHA256:
-        print(
-            "[gc-trace] WARNING: SystemDatabase.garbage_collect has changed "
-            "since this instrumentation was written.\n"
-            f"[gc-trace]   expected {_GC_SOURCE_SHA256}\n"
-            f"[gc-trace]   found    {digest}\n"
-            "[gc-trace] Instrumentation NOT installed: it would time SQL the "
-            "shipped collector no longer issues. Re-copy the implementation, "
-            "update _GC_SOURCE_SHA256, or set GC_TRACE=0 to silence this.",
-            flush=True,
-        )
-        return
+    replaced = _GC_SOURCE_VARIANTS.get(
+        digest, f"an unrecognized collector ({digest[:12]})"
+    )
+
+    # 2.32.0a3's _workflow_commands.garbage_collect unpacks the result as
+    # `cutoff, pending_ids = result`, and the conductor can reach that path, so
+    # the old SDK still has to get a tuple back. list_retained_workflow_ids is
+    # the marker: the SDK that moved the trailing scan out is the one that
+    # expects a bare cutoff.
+    returns_tuple = not hasattr(SystemDatabase, "list_retained_workflow_ids")
 
     ws = SystemSchema.workflow_status
 
@@ -539,15 +543,6 @@ def _install_gc_instrumentation() -> None:
         rows = c.execute(stmt).rowcount
         rows = max(0, rows)
         trace.record(phase, time.perf_counter() - t0, rows)
-        return rows
-
-    def _timed_fetchall(phase, c, stmt):
-        trace.enter(phase)
-        t0 = time.perf_counter()
-        # execute() and fetchall() timed together: psycopg buffers the whole
-        # result client-side, so the split between them is an artifact.
-        rows = c.execute(stmt).fetchall()
-        trace.record(phase, time.perf_counter() - t0, len(rows))
         return rows
 
     class _Explain(sa.sql.expression.Executable, sa.sql.expression.ClauseElement):
@@ -623,25 +618,40 @@ def _install_gc_instrumentation() -> None:
                 flush=True,
             )
 
+    # completed_at is set on every terminal transition and cleared on resume,
+    # so ordering and cutting on it needs no status filter, and rows still in
+    # flight hold NULL and never compare true.
+    key = ws.c.completed_at
+
     def _instrumented_garbage_collect(
         self,
         cutoff_epoch_timestamp_ms: Optional[int],
         rows_threshold: Optional[int],
         batch_size: Optional[int],
     ):
-        """Line-for-line copy of SystemDatabase.garbage_collect, timed."""
+        """Line-for-line copy of SystemDatabase.garbage_collect, timed.
+
+        Always the completed_at collector, whatever the installed dbos ships.
+        Only the return shape adapts, so an SDK that still expects the trailing
+        scan's id list keeps working.
+        """
         if batch_size is not None and batch_size < 1:
             raise ValueError(f"batch_size must be a positive integer, got {batch_size}")
         trace.start_round()
 
         if rows_threshold is not None:
+            # IS NOT NULL so an in-flight row cannot supply the cutoff.
+            preds = [
+                key.isnot(None),
+                self._name_filter(ws.c.application_name, self.app_name),
+            ]
             with _Txn(self) as c:
                 result = _timed_scalar(
                     "threshold_probe",
                     c,
-                    sa.select(ws.c.created_at)
-                    .where(self._name_filter(ws.c.application_name, self.app_name))
-                    .order_by(ws.c.created_at.desc())
+                    sa.select(key)
+                    .where(*preds)
+                    .order_by(key.desc())
                     .limit(1)
                     .offset(rows_threshold - 1),
                 )
@@ -656,15 +666,11 @@ def _install_gc_instrumentation() -> None:
             return None
         trace.set_cutoff(cutoff_epoch_timestamp_ms)
 
+        # One predicate covers eligibility, so nothing has to fetch the heap
+        # row to evaluate a status filter. Unclaimed rows included: excluding
+        # them would leak pre-upgrade rows forever.
         gc_filter = sa.and_(
-            ws.c.created_at < sa.literal(cutoff_epoch_timestamp_ms, sa.BigInteger),
-            ~ws.c.status.in_(
-                [
-                    WorkflowStatusString.PENDING.value,
-                    WorkflowStatusString.ENQUEUED.value,
-                    WorkflowStatusString.DELAYED.value,
-                ]
-            ),
+            key < sa.literal(cutoff_epoch_timestamp_ms, sa.BigInteger),
             self._name_filter(ws.c.application_name, self.app_name),
         )
 
@@ -698,9 +704,9 @@ def _install_gc_instrumentation() -> None:
                 nonlocal explained
                 with _Txn(self) as c:
                     probe = (
-                        sa.select(ws.c.created_at)
-                        .where(gc_filter, ws.c.created_at > watermark)
-                        .order_by(ws.c.created_at)
+                        sa.select(key)
+                        .where(gc_filter, key > watermark)
+                        .order_by(key)
                         .limit(1)
                         .offset(batch_size - 1)
                     )
@@ -711,17 +717,21 @@ def _install_gc_instrumentation() -> None:
                     if first and trace.explain:
                         _explain(c, "batch_probe", probe)
                     step = _timed_scalar("batch_probe", c, probe)
-                    if step is None:
-                        _timed_dml("final_delete", c, sa.delete(ws).where(gc_filter))
-                        return None
-                    delete = sa.delete(ws).where(
-                        gc_filter,
-                        ws.c.created_at > watermark,
-                        ws.c.created_at <= step,
-                    )
+                    # A row that terminalizes mid-pass takes completed_at >
+                    # cutoff, so it can never fall below the watermark: the
+                    # tail above it is all that remains. Ties on the key may
+                    # push a bounded batch slightly over batch_size.
+                    bounds = [gc_filter, key > watermark]
+                    if step is not None:
+                        bounds.append(key <= step)
+                    delete = sa.delete(ws).where(*bounds)
                     if first:
                         _explain(c, "batch_delete", delete, rollback=True)
-                    _timed_dml("batch_delete", c, delete)
+                    _timed_dml(
+                        "batch_delete" if step is not None else "final_delete",
+                        c,
+                        delete,
+                    )
                     return step
 
             watermark = 0
@@ -736,22 +746,22 @@ def _install_gc_instrumentation() -> None:
                     break
                 watermark = next_watermark
 
-        trailing = sa.select(ws.c.workflow_uuid).where(
-            ws.c.created_at < sa.literal(cutoff_epoch_timestamp_ms, sa.BigInteger),
-            self._name_filter(ws.c.application_name, self.app_name),
-        )
-        with _Txn(self) as c:
-            if trace.explain:
-                _explain(c, "trailing_scan", trailing)
-            rows = _timed_fetchall("trailing_scan", c, trailing)
         trace.finish_round()
-        return cutoff_epoch_timestamp_ms, [row[0] for row in rows]
+        # No trailing scan to run, so the id list an older SDK expects is
+        # always empty. It only feeds the deprecated application database,
+        # which this benchmark does not configure.
+        return (
+            (cutoff_epoch_timestamp_ms, [])
+            if returns_tuple
+            else (cutoff_epoch_timestamp_ms)
+        )
 
     SystemDatabase.garbage_collect = _instrumented_garbage_collect
     if trace.watchdog_s > 0:
         threading.Thread(target=trace.watchdog, daemon=True).start()
     print(
-        f"[gc-trace] installed (batch_every={trace.batch_every} "
+        f"[gc-trace] installed: completed_at collector, replacing {replaced} "
+        f"(batch_every={trace.batch_every} "
         f"watchdog={trace.watchdog_s:g}s explain={trace.explain})",
         flush=True,
     )

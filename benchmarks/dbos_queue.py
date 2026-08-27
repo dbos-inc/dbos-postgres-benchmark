@@ -196,6 +196,519 @@ def worker_entry(
         DBOS.destroy()
 
 
+# ===========================================================================
+# BEGIN TEMPORARY GC INSTRUMENTATION
+#
+# Removing it is this block plus the single _install_gc_instrumentation() call
+# at the top of gc_entry(). Nothing else in the file knows it exists.
+#
+# A reimplementation rather than a wrapper, because the shipped collector does
+# all of its work in closures -- delete_batch and retry_on_serialization_error
+# inside SystemDatabase.garbage_collect -- so there is no seam to hook that
+# could say which phase of a round the time went to. A round is otherwise a
+# black box between two prints, and rounds at this scale run for tens of
+# minutes.
+#
+# It calls DBOS private API on purpose (SystemSchema, _name_filter,
+# _is_serialization_error): the point is to execute the same SQL the shipped
+# collector executes, not something like it.
+#
+# Configured by environment variable rather than argparse, so no flag has to be
+# threaded through main() -> run_multiprocess() -> gc_entry() and then
+# unthreaded again when this comes out:
+#
+#   GC_TRACE=0               Do not install. Default: install.
+#   GC_TRACE_BATCH_EVERY=50  Progress line every N batches (0 = none).
+#   GC_TRACE_WATCHDOG=30     Seconds between "still running" lines (0 = none).
+#                            This is what makes a stalled round visible while
+#                            it is stalled rather than once it ends.
+#   GC_TRACE_EXPLAIN=0       EXPLAIN (ANALYZE, BUFFERS) the batch probe and the
+#                            trailing scan, once per round. Off by default: it
+#                            re-runs the statement it explains, and for the
+#                            trailing scan that can double the round. Only the
+#                            two SELECTs are ever explained -- EXPLAIN ANALYZE
+#                            on a DELETE would delete.
+#   GC_TRACE_CSV=<path>      Append one line per SQL statement executed.
+# ===========================================================================
+
+# sha256 of inspect.getsource(SystemDatabase.garbage_collect) in dbos==2.32.0a3,
+# the implementation the reimplementation below was copied from. Checked at
+# install: a bump that rewrites the collector leaves this measuring SQL that is
+# no longer issued, and every conclusion drawn from it would be wrong. Warn
+# rather than raise, so a drifted version costs the run its instrumentation
+# instead of its garbage collection.
+_GC_SOURCE_SHA256 = "a6136081ed96fbee6ac96e0a151f37cb9e6398731ec523434b738aa10b1a908a"
+
+
+def _fmt_dur(seconds: float) -> str:
+    return f"{seconds * 1000:.1f}ms" if seconds < 1.0 else f"{seconds:.2f}s"
+
+
+class _GCTrace:
+    """Per-statement timings for one GC round, plus the live state a watchdog
+    thread reads while that round is still in flight.
+
+    One instance per GC process. The lock orders the sweeping thread against
+    the watchdog thread only; every GC statement costs milliseconds at least,
+    so an uncontended acquire beside one is not measurable.
+    """
+
+    # Statement phases, in the order a round executes them.
+    PHASES = (
+        "threshold_probe",  # rows_threshold cutoff lookup (unused at rows_threshold=None)
+        "checkout",  # pool checkout + BEGIN
+        "batch_probe",  # SELECT created_at ... ORDER BY created_at LIMIT 1 OFFSET n-1
+        "batch_delete",  # DELETE of one batch
+        "final_delete",  # DELETE of everything still below the cutoff
+        "commit",
+        "trailing_scan",  # SELECT workflow_uuid WHERE created_at < cutoff -- unbounded
+    )
+
+    def __init__(
+        self,
+        batch_every: int,
+        watchdog_s: float,
+        explain: bool,
+        csv_path: Optional[str],
+    ) -> None:
+        self.batch_every = batch_every
+        self.watchdog_s = watchdog_s
+        self.explain = explain
+        self._lock = threading.Lock()
+        self.round = 0
+        self.round_active = False
+        self.round_started = time.monotonic()
+        # Live state, read by the watchdog between statements.
+        self.phase = "idle"
+        self.phase_started = time.monotonic()
+        self.batches = 0
+        self.retries = 0
+        self.cutoff: Optional[int] = None
+        self.watermark = 0
+        self.samples: dict[str, list[float]] = {}
+        self.rowcounts: dict[str, int] = {}
+        self._csv = None
+        if csv_path:
+            # Line-buffered and append-only: a run that is killed mid-round
+            # still leaves every statement it had already timed on disk.
+            self._csv = open(csv_path, "a", buffering=1)
+            if self._csv.tell() == 0:
+                self._csv.write("wall,round,batch,phase,elapsed_s,rows\n")
+
+    # --- recording -------------------------------------------------------
+
+    def start_round(self) -> int:
+        with self._lock:
+            self.round += 1
+            self.round_active = True
+            self.round_started = time.monotonic()
+            self.batches = 0
+            self.retries = 0
+            self.cutoff = None
+            self.watermark = 0
+            self.samples = {}
+            self.rowcounts = {}
+            self.phase = "starting"
+            self.phase_started = self.round_started
+            return self.round
+
+    def set_cutoff(self, cutoff_epoch_ms: int) -> None:
+        with self._lock:
+            self.cutoff = cutoff_epoch_ms
+
+    def enter(self, phase: str) -> None:
+        with self._lock:
+            self.phase = phase
+            self.phase_started = time.monotonic()
+
+    def record(self, phase: str, elapsed: float, rows: int) -> None:
+        with self._lock:
+            self.samples.setdefault(phase, []).append(elapsed)
+            self.rowcounts[phase] = self.rowcounts.get(phase, 0) + rows
+            self.phase = f"{phase} (done)"
+            if self._csv is not None:
+                self._csv.write(
+                    f"{time.time():.3f},{self.round},{self.batches},"
+                    f"{phase},{elapsed:.6f},{rows}\n"
+                )
+
+    def note_retry(self, backoff: float, error: Exception) -> None:
+        with self._lock:
+            self.retries += 1
+            n, rnd = self.retries, self.round
+        # Printed, not logged: gc_entry builds a SystemDatabase without a DBOS
+        # runtime, so dbos_logger has no handler configured here.
+        print(
+            f"[gc-trace] round {rnd} serialization retry {n} "
+            f"(backoff {backoff:.2f}s): {type(error).__name__}: {error}",
+            flush=True,
+        )
+
+    def note_batch(self, watermark: int) -> None:
+        with self._lock:
+            self.batches += 1
+            self.watermark = watermark
+            n = self.batches
+            if not self.batch_every or n % self.batch_every:
+                return
+            line = self._progress_locked()
+        print(line, flush=True)
+
+    # --- reporting -------------------------------------------------------
+
+    def _progress_locked(self) -> str:
+        """One line describing the round in flight. Caller holds the lock."""
+        elapsed = time.monotonic() - self.round_started
+        deleted = self.rowcounts.get("batch_delete", 0) + self.rowcounts.get(
+            "final_delete", 0
+        )
+        if self.cutoff is not None and self.watermark > 0:
+            behind = f"{(self.cutoff - self.watermark) / 60000.0:.1f} min"
+        else:
+            behind = "n/a"
+        parts = []
+        for phase in ("batch_probe", "batch_delete", "commit"):
+            v = self.samples.get(phase)
+            if v:
+                parts.append(
+                    f"{phase} p50={_fmt_dur(percentile(v, 50))} "
+                    f"p95={_fmt_dur(percentile(v, 95))}"
+                )
+        return (
+            f"[gc-trace] round {self.round} batch {self.batches}: "
+            f"{deleted:,} rows, {elapsed:.1f}s, {behind} of data left below "
+            f"the cutoff, " + ", ".join(parts)
+        )
+
+    def watchdog(self) -> None:
+        """Say what a round is doing while it is doing it.
+
+        The whole reason this block exists: a round that runs for tens of
+        minutes otherwise reports nothing at all until it ends, so a stall is
+        indistinguishable from slow progress until after the fact.
+        """
+        while True:
+            time.sleep(self.watchdog_s)
+            with self._lock:
+                if not self.round_active:
+                    continue
+                stuck = time.monotonic() - self.phase_started
+                line = self._progress_locked()
+                phase = self.phase
+            print(
+                f"{line}\n[gc-trace]   in phase {phase} for {stuck:.1f}s",
+                flush=True,
+            )
+
+    def finish_round(self) -> None:
+        with self._lock:
+            self.round_active = False
+            self.phase = "idle"
+            total = time.monotonic() - self.round_started
+            samples = {p: list(v) for p, v in self.samples.items()}
+            rows = dict(self.rowcounts)
+            batches, retries, rnd = self.batches, self.retries, self.round
+        deleted = rows.get("batch_delete", 0) + rows.get("final_delete", 0)
+        # Exact, unlike the n_tup_del delta gc_entry reports: a DELETE's
+        # rowcount is this round's own work, with no publication delay to hand
+        # part of it to the next round.
+        print(
+            f"[gc-trace] round {rnd}: {total:.2f}s, {batches} batches, "
+            f"{deleted:,} rows deleted, {retries} serialization retries",
+            flush=True,
+        )
+        accounted = 0.0
+        for phase in self.PHASES:
+            v = samples.get(phase)
+            if not v:
+                continue
+            accounted += sum(v)
+            print(
+                f"[gc-trace]   {phase:<16} n={len(v):<6} "
+                f"total={sum(v):9.2f}s  p50={_fmt_dur(percentile(v, 50)):>9} "
+                f"p95={_fmt_dur(percentile(v, 95)):>9} "
+                f"max={_fmt_dur(max(v)):>9}  rows={rows.get(phase, 0):,}",
+                flush=True,
+            )
+        pct = 100.0 * accounted / total if total > 0 else 0.0
+        # The gap is the first thing to read: if a round is not mostly SQL,
+        # it is waiting on the pool or sleeping in serialization backoff, and
+        # no amount of query tuning is the answer.
+        print(
+            f"[gc-trace]   {'accounted':<16} {accounted:.2f}s of {total:.2f}s "
+            f"({pct:.1f}% inside execute; the rest is Python, pool waits and "
+            f"retry backoff)",
+            flush=True,
+        )
+
+
+def _install_gc_instrumentation() -> None:
+    """Replace SystemDatabase.garbage_collect with a statement-timed copy.
+
+    Called from inside the GC process, after it has imported DBOS. Every DBOS
+    import lives in here rather than at module scope, because the parent
+    process imports this file and must never import DBOS.
+    """
+    import functools
+    import hashlib
+    import inspect
+
+    import sqlalchemy as sa
+    from dbos._schemas.system_database import SystemSchema
+    from dbos._sys_db import SystemDatabase, WorkflowStatusString
+    from sqlalchemy.exc import DBAPIError
+
+    if os.environ.get("GC_TRACE", "1") == "0":
+        return
+
+    trace = _GCTrace(
+        batch_every=int(os.environ.get("GC_TRACE_BATCH_EVERY", "50")),
+        watchdog_s=float(os.environ.get("GC_TRACE_WATCHDOG", "30")),
+        explain=os.environ.get("GC_TRACE_EXPLAIN", "0") != "0",
+        csv_path=os.environ.get("GC_TRACE_CSV") or None,
+    )
+
+    digest = hashlib.sha256(
+        inspect.getsource(SystemDatabase.garbage_collect).encode()
+    ).hexdigest()
+    if digest != _GC_SOURCE_SHA256:
+        print(
+            "[gc-trace] WARNING: SystemDatabase.garbage_collect has changed "
+            "since this instrumentation was written.\n"
+            f"[gc-trace]   expected {_GC_SOURCE_SHA256}\n"
+            f"[gc-trace]   found    {digest}\n"
+            "[gc-trace] Instrumentation NOT installed: it would time SQL the "
+            "shipped collector no longer issues. Re-copy the implementation, "
+            "update _GC_SOURCE_SHA256, or set GC_TRACE=0 to silence this.",
+            flush=True,
+        )
+        return
+
+    ws = SystemSchema.workflow_status
+
+    class _Txn:
+        """``engine.begin()`` split into its three separately timed costs: pool
+        checkout plus BEGIN, the statements, and the commit.
+
+        The same round trips the shipped code makes -- ``engine.begin()`` is
+        connect, begin, commit on success or rollback on error, then close --
+        just with the commit outside the region attributed to the statements.
+        Commit is where a batch waits on WAL flush, and lumping it into the
+        DELETE would hide that.
+        """
+
+        def __init__(self, db: "SystemDatabase") -> None:
+            self.db = db
+
+        def __enter__(self) -> "sa.Connection":
+            trace.enter("checkout")
+            t0 = time.perf_counter()
+            self.conn = self.db.engine.connect()
+            self.txn = self.conn.begin()
+            trace.record("checkout", time.perf_counter() - t0, 0)
+            return self.conn
+
+        def __exit__(self, exc_type, exc, tb) -> bool:
+            try:
+                if exc_type is None:
+                    trace.enter("commit")
+                    t0 = time.perf_counter()
+                    self.txn.commit()
+                    trace.record("commit", time.perf_counter() - t0, 0)
+                else:
+                    self.txn.rollback()
+            finally:
+                self.conn.close()
+            return False
+
+    def _timed_scalar(phase, c, stmt):
+        trace.enter(phase)
+        t0 = time.perf_counter()
+        value = c.execute(stmt).scalar()
+        trace.record(phase, time.perf_counter() - t0, 0 if value is None else 1)
+        return value
+
+    def _timed_dml(phase, c, stmt) -> int:
+        trace.enter(phase)
+        t0 = time.perf_counter()
+        rows = c.execute(stmt).rowcount
+        rows = max(0, rows)
+        trace.record(phase, time.perf_counter() - t0, rows)
+        return rows
+
+    def _timed_fetchall(phase, c, stmt):
+        trace.enter(phase)
+        t0 = time.perf_counter()
+        # execute() and fetchall() timed together: psycopg buffers the whole
+        # result client-side, so the split between them is an artifact.
+        rows = c.execute(stmt).fetchall()
+        trace.record(phase, time.perf_counter() - t0, len(rows))
+        return rows
+
+    def _explain(c, label, stmt) -> None:
+        """EXPLAIN (ANALYZE, BUFFERS) one SELECT, on the connection that is
+        about to run it so it sees the same snapshot. Best effort: a compile
+        that goes wrong costs the plan, not the round."""
+        try:
+            sql = str(
+                stmt.compile(
+                    dialect=c.dialect,
+                    # The tables carry a placeholder schema that only the
+                    # engine's execution options resolve, so compiling without
+                    # the map would emit a schema that does not exist.
+                    schema_translate_map=c.get_execution_options().get(
+                        "schema_translate_map"
+                    ),
+                    compile_kwargs={"literal_binds": True},
+                )
+            )
+            plan = c.exec_driver_sql("EXPLAIN (ANALYZE, BUFFERS) " + sql).fetchall()
+            print(f"[gc-trace] round {trace.round} EXPLAIN {label}:", flush=True)
+            for row in plan:
+                print(f"[gc-trace]   {row[0]}", flush=True)
+        except Exception as e:
+            print(
+                f"[gc-trace] EXPLAIN {label} failed: {type(e).__name__}: {e}",
+                flush=True,
+            )
+
+    def _instrumented_garbage_collect(
+        self,
+        cutoff_epoch_timestamp_ms: Optional[int],
+        rows_threshold: Optional[int],
+        batch_size: Optional[int],
+    ):
+        """Line-for-line copy of SystemDatabase.garbage_collect, timed."""
+        if batch_size is not None and batch_size < 1:
+            raise ValueError(f"batch_size must be a positive integer, got {batch_size}")
+        trace.start_round()
+
+        if rows_threshold is not None:
+            with _Txn(self) as c:
+                result = _timed_scalar(
+                    "threshold_probe",
+                    c,
+                    sa.select(ws.c.created_at)
+                    .where(self._name_filter(ws.c.application_name, self.app_name))
+                    .order_by(ws.c.created_at.desc())
+                    .limit(1)
+                    .offset(rows_threshold - 1),
+                )
+                if result is not None and (
+                    cutoff_epoch_timestamp_ms is None
+                    or result > cutoff_epoch_timestamp_ms
+                ):
+                    cutoff_epoch_timestamp_ms = result
+
+        if cutoff_epoch_timestamp_ms is None:
+            trace.finish_round()
+            return None
+        trace.set_cutoff(cutoff_epoch_timestamp_ms)
+
+        gc_filter = sa.and_(
+            ws.c.created_at < sa.literal(cutoff_epoch_timestamp_ms, sa.BigInteger),
+            ~ws.c.status.in_(
+                [
+                    WorkflowStatusString.PENDING.value,
+                    WorkflowStatusString.ENQUEUED.value,
+                    WorkflowStatusString.DELAYED.value,
+                ]
+            ),
+            self._name_filter(ws.c.application_name, self.app_name),
+        )
+
+        def retry_on_serialization_error(operation):
+            max_attempts, backoff, max_backoff = 10, 0.05, 2.0
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return operation()
+                except DBAPIError as e:
+                    if not self._is_serialization_error(e):
+                        raise
+                    if attempt == max_attempts:
+                        raise
+                    actual_backoff = backoff * (0.5 + random.random())
+                    trace.note_retry(actual_backoff, e)
+                    time.sleep(actual_backoff)
+                    backoff = min(backoff * 2, max_backoff)
+            raise AssertionError("unreachable")
+
+        if batch_size is None:
+
+            def delete_all() -> None:
+                with _Txn(self) as c:
+                    _timed_dml("final_delete", c, sa.delete(ws).where(gc_filter))
+
+            retry_on_serialization_error(delete_all)
+        else:
+            explained = False
+
+            def delete_batch(watermark: int) -> Optional[int]:
+                nonlocal explained
+                with _Txn(self) as c:
+                    probe = (
+                        sa.select(ws.c.created_at)
+                        .where(gc_filter, ws.c.created_at > watermark)
+                        .order_by(ws.c.created_at)
+                        .limit(1)
+                        .offset(batch_size - 1)
+                    )
+                    if trace.explain and not explained:
+                        explained = True
+                        _explain(c, "batch_probe", probe)
+                    step = _timed_scalar("batch_probe", c, probe)
+                    if step is None:
+                        _timed_dml("final_delete", c, sa.delete(ws).where(gc_filter))
+                        return None
+                    _timed_dml(
+                        "batch_delete",
+                        c,
+                        sa.delete(ws).where(
+                            gc_filter,
+                            ws.c.created_at > watermark,
+                            ws.c.created_at <= step,
+                        ),
+                    )
+                    return step
+
+            watermark = 0
+            while True:
+                next_watermark = retry_on_serialization_error(
+                    functools.partial(delete_batch, watermark)
+                )
+                trace.note_batch(
+                    watermark if next_watermark is None else next_watermark
+                )
+                if next_watermark is None:
+                    break
+                watermark = next_watermark
+
+        trailing = sa.select(ws.c.workflow_uuid).where(
+            ws.c.created_at < sa.literal(cutoff_epoch_timestamp_ms, sa.BigInteger),
+            self._name_filter(ws.c.application_name, self.app_name),
+        )
+        with _Txn(self) as c:
+            if trace.explain:
+                _explain(c, "trailing_scan", trailing)
+            rows = _timed_fetchall("trailing_scan", c, trailing)
+        trace.finish_round()
+        return cutoff_epoch_timestamp_ms, [row[0] for row in rows]
+
+    SystemDatabase.garbage_collect = _instrumented_garbage_collect
+    if trace.watchdog_s > 0:
+        threading.Thread(target=trace.watchdog, daemon=True).start()
+    print(
+        f"[gc-trace] installed (batch_every={trace.batch_every} "
+        f"watchdog={trace.watchdog_s:g}s explain={trace.explain})",
+        flush=True,
+    )
+
+
+# ===========================================================================
+# END TEMPORARY GC INSTRUMENTATION
+# ===========================================================================
+
+
 def gc_entry(
     gc_minutes: float,
     gc_interval: float,
@@ -223,6 +736,10 @@ def gc_entry(
     from dbos._serialization import DefaultSerializer
     from dbos._sys_db import SystemDatabase
     from dbos._workflow_commands import DEFAULT_GC_BATCH_SIZE
+
+    # TEMPORARY: see the instrumentation block above. One line in, one
+    # block out.
+    _install_gc_instrumentation()
 
     # app_name is the same contract the workers and enqueuers share: GC filters
     # on it, so a name that doesn't match sweeps nothing and every round reports

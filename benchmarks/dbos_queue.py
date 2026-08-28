@@ -239,13 +239,24 @@ def gc_entry(
     """
     import sqlalchemy as sa
     from dbos import _workflow_commands
+    from dbos._logger import dbos_logger, init_logger
     from dbos._serialization import DefaultSerializer
     from dbos._sys_db import SystemDatabase
 
+    # DBOS.launch() does this; nothing here launches one, so without it the
+    # "contention or deadlock detected in workflow garbage collection" warnings
+    # SystemDatabase.garbage_collect emits fall through to logging.lastResort:
+    # unformatted, and only visible at all because WARNING clears its threshold.
+    init_logger()
+
     class GCTarget:
-        """The two attributes _workflow_commands.garbage_collect reads off a
-        DBOS. Duck-typed on purpose: the parameter is annotated, never
-        isinstance checked, so this reaches the function without a runtime."""
+        """What _workflow_commands.garbage_collect reads off a DBOS. Duck-typed
+        on purpose: the parameter is annotated, never isinstance checked, so
+        this reaches the function without a runtime."""
+
+        # The same object DBOS.logger hands back, so anything reached through
+        # the stand-in logs where a real runtime would.
+        logger = dbos_logger
 
         __slots__ = ("_sys_db", "_app_db")
 

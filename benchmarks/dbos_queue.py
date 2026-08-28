@@ -243,11 +243,18 @@ def gc_entry(
     from dbos._serialization import DefaultSerializer
     from dbos._sys_db import SystemDatabase
 
-    # DBOS.launch() does this; nothing here launches one, so without it the
-    # "contention or deadlock detected in workflow garbage collection" warnings
-    # SystemDatabase.garbage_collect emits fall through to logging.lastResort:
-    # unformatted, and only visible at all because WARNING clears its threshold.
+    # Both halves of what DBOS.launch() does to the logger, because nothing
+    # here launches one. init_logger() attaches the console handler; without it
+    # the "contention or deadlock detected in workflow garbage collection"
+    # warnings SystemDatabase.garbage_collect emits fall through to
+    # logging.lastResort, unformatted.
+    #
+    # It sets no level though, and the logger's own is NOTSET, so it would
+    # inherit WARNING from the root and drop everything below -- setLevel is
+    # what actually makes the collector's logs visible. INFO because that is
+    # what a launched runtime resolves telemetry.logs.logLevel to by default.
     init_logger()
+    dbos_logger.setLevel("INFO")
 
     class GCTarget:
         """What _workflow_commands.garbage_collect reads off a DBOS. Duck-typed

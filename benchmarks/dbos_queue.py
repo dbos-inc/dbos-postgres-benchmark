@@ -214,12 +214,22 @@ def gc_entry(
 ) -> None:
     """Every gc_interval minutes, sweep workflows older than gc_minutes.
 
-    Drives a SystemDatabase built here rather than a launched runtime: garbage
-    collection is all this process does, so it registers no workflow, runs no
-    queue thread and dequeues nothing -- the sweep never waits behind a queue
-    thread for a connection. One process per run, not a pool: concurrent sweeps
-    would contend on the same rows and the round times would measure that
-    contention rather than the collector.
+    Calls dbos._workflow_commands.garbage_collect, the same entry point the
+    admin server and the conductor use, so the run measures the collector users
+    actually get rather than one layer beneath it.
+
+    That function takes a DBOS, but only ever reads ._sys_db and ._app_db off
+    it, so it is handed a stand-in holding those two rather than a launched
+    runtime. Launching one here would register queues, start queue threads and
+    run recovery in the collector's own process, and the sweep would then wait
+    behind a queue thread for a pool connection -- which is exactly the
+    contention the split-process design exists to keep out of the measurement.
+    ._app_db is None because the benchmark configures no application database,
+    which is also what skips that path's extra pre-cutoff id scan.
+
+    One process per run, not a pool: concurrent sweeps would contend on the
+    same rows and the round times would measure that contention rather than the
+    collector.
 
     Every round is independent and failure is per-round: a sweep that raises is
     counted, logged and retried at the next grid slot on a fresh handle, so a
@@ -228,9 +238,22 @@ def gc_entry(
     GC at all.
     """
     import sqlalchemy as sa
+    from dbos import _workflow_commands
     from dbos._serialization import DefaultSerializer
     from dbos._sys_db import SystemDatabase
-    from dbos._workflow_commands import DEFAULT_GC_BATCH_SIZE
+
+    class GCTarget:
+        """The two attributes _workflow_commands.garbage_collect reads off a
+        DBOS. Duck-typed on purpose: the parameter is annotated, never
+        isinstance checked, so this reaches the function without a runtime."""
+
+        __slots__ = ("_sys_db", "_app_db")
+
+        def __init__(self, sys_db) -> None:
+            self._sys_db = sys_db
+            # No application database here, so its (deprecated) cleanup is
+            # skipped -- as it is for any system-database-only application.
+            self._app_db = None
 
     # app_name is the same contract the workers and enqueuers share: GC filters
     # on it, so a name that doesn't match sweeps nothing and every round reports
@@ -345,10 +368,11 @@ def gc_entry(
                 # still collects everything that has aged out by the time it
                 # runs, rather than leaving the overrun to the next round.
                 cutoff_ms = int((time.time() - retention_s) * 1000)
-                sys_db.garbage_collect(
-                    cutoff_epoch_timestamp_ms=cutoff_ms,
-                    rows_threshold=None,
-                    batch_size=DEFAULT_GC_BATCH_SIZE,
+                _workflow_commands.garbage_collect(
+                    GCTarget(sys_db),
+                    cutoff_ms,
+                    None,
+                    batch_size=_workflow_commands.DEFAULT_GC_BATCH_SIZE,
                 )
                 elapsed = time.monotonic() - start
             except Exception as e:

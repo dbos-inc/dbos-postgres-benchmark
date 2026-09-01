@@ -188,6 +188,12 @@ def worker_entry(
         "max_executor_threads": executor_threads,
         "executor_id": str(uuid.uuid7()),
         "conductor_key": os.environ.get("DBOS_CONDUCTOR_KEY"),
+        # Off: dual write stores every payload twice, in the legacy
+        # workflow_status columns as well as workflow_outputs. It defaults on
+        # so a reader predating those tables still finds payloads, and nothing
+        # in this benchmark is such a reader -- leaving it on would double the
+        # payload write volume the run exists to measure.
+        "dual_write_payloads": False,
     }
     DBOS(config=config)
     # No listen_queues: without a filter, every worker polls every queue this
@@ -477,6 +483,9 @@ def enqueuer_entry(
         system_database_url=os.environ["BENCHMARK_DATABASE_URL"],
         system_database_pool_size=pool_size,
         application_name=APP_NAME,
+        # Matches the workers: inputs go to workflow_inputs only, not also to
+        # the legacy workflow_status.inputs column.
+        dual_write_payloads=False,
     )
 
     # Wait until all processes are started before beginning the benchmark.

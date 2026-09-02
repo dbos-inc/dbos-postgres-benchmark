@@ -75,16 +75,6 @@ JOIN pg_stat_activity a USING (pid)
 LEFT JOIN pg_class par ON par.reltoastrelid = p.relid;
 
 \echo
-\echo == autovacuum worker backends ==
-SELECT pid,
-       date_trunc('second', now()-xact_start) AS running_for,
-       state,
-       query
-FROM pg_stat_activity
-WHERE query LIKE 'autovacuum:%'
-ORDER BY xact_start;
-
-\echo
 \echo == table size: heap vs indexes vs TOAST ==
 SELECT s.relname,
        pg_size_pretty(pg_total_relation_size(s.relid))              AS total,
@@ -101,12 +91,26 @@ ORDER BY pg_total_relation_size(s.relid) DESC
 LIMIT 8;
 
 \echo
-\echo == effective autovacuum settings ==
-SELECT name, setting, unit
-FROM pg_settings
-WHERE name IN ('autovacuum','autovacuum_max_workers','autovacuum_naptime',
-               'autovacuum_vacuum_threshold','autovacuum_vacuum_scale_factor',
-               'autovacuum_vacuum_insert_threshold','autovacuum_vacuum_cost_delay',
-               'autovacuum_vacuum_cost_limit','autovacuum_work_mem')
-ORDER BY name;
+\echo == 5 longest-running queries ==
+SELECT a.pid,
+       COALESCE(NULLIF(a.application_name,''),'-')                 AS app,
+       a.state,
+       date_trunc('second', now()-a.query_start)                   AS query_age,
+       -- The more dangerous number: a transaction still open pins the xmin
+       -- horizon and blocks vacuum from reclaiming anything newer, whether or
+       -- not a statement is currently running in it.
+       date_trunc('second', now()-a.xact_start)                    AS xact_age,
+       age(a.backend_xmin)                                         AS xmin_age,
+       COALESCE(a.wait_event_type||':'||a.wait_event,'-')          AS wait,
+       left(regexp_replace(a.query,'[[:space:]]+',' ','g'), 48)    AS query
+FROM pg_stat_activity a
+-- 'idle' backends keep their last query and its start time, which would top
+-- the sort forever; 'idle in transaction' stays, because that is the state
+-- that starves autovacuum.
+WHERE a.pid <> pg_backend_pid()
+  AND a.state IS DISTINCT FROM 'idle'
+  AND a.query_start IS NOT NULL
+ORDER BY now()-a.query_start DESC
+LIMIT 5;
+
 SQL

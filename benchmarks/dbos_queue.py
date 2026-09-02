@@ -188,12 +188,6 @@ def worker_entry(
         "max_executor_threads": executor_threads,
         "executor_id": str(uuid.uuid7()),
         "conductor_key": os.environ.get("DBOS_CONDUCTOR_KEY"),
-        # Off: dual write stores every payload twice, in the legacy
-        # workflow_status columns as well as workflow_outputs. It defaults on
-        # so a reader predating those tables still finds payloads, and nothing
-        # in this benchmark is such a reader -- leaving it on would double the
-        # payload write volume the run exists to measure.
-        "dual_write_payloads": False,
     }
     DBOS(config=config)
     # No listen_queues: without a filter, every worker polls every queue this
@@ -483,9 +477,6 @@ def enqueuer_entry(
         system_database_url=os.environ["BENCHMARK_DATABASE_URL"],
         system_database_pool_size=pool_size,
         application_name=APP_NAME,
-        # Matches the workers: inputs go to workflow_inputs only, not also to
-        # the legacy workflow_status.inputs column.
-        dual_write_payloads=False,
     )
 
     # Wait until all processes are started before beginning the benchmark.
@@ -805,6 +796,18 @@ def run_multiprocess(
     # One buffer for inputs, workflow output and step outputs alike, so a run
     # varies one number rather than three.
     data_payload = os.urandom(data_kb * 1024) if data_kb > 0 else None
+
+    # Dual write stores every payload twice: in the legacy workflow_status
+    # columns as well as in workflow_inputs/workflow_outputs. It defaults on so
+    # a reader predating those tables still finds payloads, and nothing here is
+    # such a reader -- leaving it on would double the payload write volume the
+    # run exists to measure. SystemDatabase reads this at construction, and the
+    # workers, enqueuers and collector are all spawned below, so setting it
+    # here reaches every one of them.
+    #
+    # setdefault, not a plain assignment: exporting the variable is then how a
+    # run turns dual write back on to measure what it costs.
+    os.environ.setdefault("DBOS__DUAL_WRITE_PAYLOADS", "false")
 
     ctx = mp.get_context("spawn")
 

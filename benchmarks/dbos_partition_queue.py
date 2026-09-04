@@ -259,7 +259,7 @@ def enqueuer_entry(
         # responsive.
         await asyncio.to_thread(enqueue_done_barrier.wait)
 
-        # --- Phase 2: drain (enqueuer 0 polls list_workflows) ---
+        # --- Phase 2: drain (enqueuer 0 polls workflow aggregates) ---
         # Enqueuer 0 polls until no ENQUEUED or PENDING workflows remain. The
         # others just wait. This avoids per-handle get_result polling pressure
         # on the system DB.
@@ -270,8 +270,11 @@ def enqueuer_entry(
         if enqueuer_id == 0:
             polls = 0
             while True:
-                unfinished = await client.list_workflows_async(
-                    status=["PENDING", "ENQUEUED"], limit=1
+                unfinished = await asyncio.to_thread(
+                    client._sys_db.get_workflow_aggregates,
+                    group_by_status=True,
+                    select_count=True,
+                    status=["PENDING", "ENQUEUED"],
                 )
                 if not unfinished:
                     break
@@ -517,7 +520,7 @@ def main() -> None:
     parser.add_argument(
         "--pool-size",
         type=int,
-        default=3,
+        default=5,
         help="System DB pool size per process (workers and enqueuers alike)",
     )
     parser.add_argument(

@@ -261,12 +261,12 @@ resource "aws_db_instance" "postgres" {
   tags = { Name = "dbos-bench-postgres" }
 }
 
-# --- EC2 (c7i.48xlarge) ---
+# --- EC2 (c7i.24xlarge) ---
 
 resource "aws_instance" "bench" {
   count                       = 1
   ami                         = "ami-04eaa218f1349d88b" # Ubuntu 24.04 LTS amd64 us-east-1
-  instance_type               = "c7i.48xlarge"
+  instance_type               = "c7i.24xlarge"
   vpc_security_group_ids      = [aws_security_group.ec2.id]
   key_name                    = var.key_name
   availability_zone           = "${var.aws_region}a"

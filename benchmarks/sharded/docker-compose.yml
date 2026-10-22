@@ -1,0 +1,18 @@
+# Four Postgres shards for running the sharded benchmark locally (local-inventory.json).
+# PgDog is not a service here: orchestrate.py starts it with a config naming however many
+# shards the run uses, exactly as it does on each client host in AWS.
+#   docker compose -f benchmarks/sharded/docker-compose.yml up -d --wait
+name: dbos-sharded-bench
+
+x-shard: &shard
+  # Pinned to the image the enterprise sharding tests use.
+  image: postgres:17@sha256:67f41722b7a8cbdb868a44a4995c846eddfdc2973bccb291ce937dce88ad5675
+  environment: { POSTGRES_PASSWORD: dbos }
+  command: postgres -c shared_preload_libraries=pg_stat_statements -c max_connections=1000
+  healthcheck: { test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres"], interval: 1s, timeout: 3s, retries: 30 }
+
+services:
+  shard0: { <<: *shard, ports: ["7101:5432"] }
+  shard1: { <<: *shard, ports: ["7102:5432"] }
+  shard2: { <<: *shard, ports: ["7103:5432"] }
+  shard3: { <<: *shard, ports: ["7104:5432"] }

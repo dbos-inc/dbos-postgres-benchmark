@@ -1,0 +1,15 @@
+{
+  "clients": [{ "local": true }],
+  "user": "postgres",
+  "password": "dbos",
+  "router_port": 6532,
+  "pgdog_docker_args": "--network dbos-sharded-bench_default -p 6532:6432 -p 9190:9090",
+  "python": "../dbos-enterprise-py/.venv/bin/python",
+  "workdir": ".",
+  "shards": [
+    { "host": "shard0", "port": 5432, "admin_host": "localhost", "admin_port": 7101 },
+    { "host": "shard1", "port": 5432, "admin_host": "localhost", "admin_port": 7102 },
+    { "host": "shard2", "port": 5432, "admin_host": "localhost", "admin_port": 7103 },
+    { "host": "shard3", "port": 5432, "admin_host": "localhost", "admin_port": 7104 }
+  ]
+}
